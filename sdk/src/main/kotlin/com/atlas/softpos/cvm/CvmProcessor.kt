@@ -127,8 +127,15 @@ class CvmProcessor(
             }
 
             CVM_ENCIPHERED_PIN_ONLINE -> {
-                // Delegate to online authorization
-                CvmRuleResult.Success(CvmMethod.ONLINE_PIN)
+                // Online PIN - requires PIN entry UI
+                // The actual PIN entry is handled by OnlinePinEntry component
+                // Here we indicate that Online PIN is required
+                if (config.onlinePinSupported) {
+                    CvmRuleResult.Success(CvmMethod.ONLINE_PIN)
+                } else {
+                    // If terminal doesn't support online PIN, try next method
+                    CvmRuleResult.NotSupported
+                }
             }
 
             CVM_PLAINTEXT_PIN_BY_ICC_WITH_SIGNATURE -> {
@@ -460,6 +467,7 @@ data class CvmConfiguration(
     val allowNoCvm: Boolean = true,
     val allowSignature: Boolean = false,
     val allowDeviceCredential: Boolean = true,  // Allow PIN/pattern as fallback
+    val onlinePinSupported: Boolean = true,  // Whether terminal supports Online PIN entry
     val biometricPromptTitle: String = "Verify Payment",
     val biometricPromptSubtitle: String = "Authenticate to complete payment"
 )
