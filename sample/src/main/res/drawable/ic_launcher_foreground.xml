@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- EMV Card Icon -->
+    <group android:translateX="24" android:translateY="24">
+        <!-- Card outline -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M5,5h50v35h-50z"
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="2"/>
+        <!-- Chip -->
+        <path
+            android:fillColor="#FFD700"
+            android:pathData="M10,15h12v10h-12z"/>
+        <!-- Contactless symbol -->
+        <path
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="2"
+            android:pathData="M40,18 Q45,22 40,26"/>
+        <path
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="2"
+            android:pathData="M44,15 Q52,22 44,29"/>
+        <path
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="2"
+            android:pathData="M48,12 Q58,22 48,32"/>
+    </group>
+</vector>
