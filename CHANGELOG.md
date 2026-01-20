@@ -5,6 +5,54 @@ All notable changes to the EMV SoftPOS SDK will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2025-01-19
+
+### Added
+
+#### Online PIN Entry (`OnlinePinEntry.kt`)
+- Production-ready secure PIN entry UI with Jetpack Compose
+- Randomizable keypad layout (configurable for shoulder-surfing prevention)
+- PIN block encryption supporting multiple formats:
+  - ISO 9564-1 Format 0 (standard EMV, XOR with PAN)
+  - ISO 9564-1 Format 4 (AES-based)
+  - Visa PIN block format
+- Security features:
+  - Screenshot prevention (FLAG_SECURE)
+  - Auto-clear after configurable timeout (default 30s)
+  - Haptic feedback instead of audio cues
+  - Memory clearing after PIN processing
+  - Maximum attempts limiting with lockout
+- Configurable PIN length (4-6 digits)
+- PIN bypass option (configurable)
+
+#### Error Recovery Framework (`TransactionErrorRecovery.kt`)
+- Comprehensive error classification for all failure scenarios:
+  - NFC errors (tag lost, transceive failed, timeout)
+  - Card response errors (SW1/SW2 handling)
+  - Network errors (timeout, SSL, unreachable)
+  - Processing errors (ODA, CVM, cryptogram failures)
+  - System errors (OOM, security violations)
+- Automatic retry with exponential backoff and jitter
+- User-friendly error messages with recovery suggestions
+- Error statistics collection for diagnostics
+- Configurable retry policies per operation
+
+#### Transaction Coordinator (`TransactionCoordinator.kt`)
+- High-level transaction orchestration with state management
+- Integration of error recovery with kernel execution
+- StateFlow-based state emission for reactive UI
+- SharedFlow events for transaction lifecycle
+- Automatic CVM handling (CDCVM/Online PIN routing)
+- Support for torn transaction recovery integration
+
+### Changed
+
+#### CVM Processor
+- Added `onlinePinSupported` configuration flag
+- Improved Online PIN method handling with proper fallback
+
+---
+
 ## [1.0.0] - 2025-01-19
 
 ### Added
@@ -121,7 +169,6 @@ com.jakewharton.timber:timber:5.0.1
 - AmEx ExpressPay kernel: Architecture defined, implementation pending
 - Discover D-PAS kernel: Architecture defined, implementation pending
 - UnionPay QuickPass kernel: Architecture defined, implementation pending
-- Online PIN entry UI: Placeholder only
 - 2nd Generate AC: Structure present, issuer scripts not processed
 
 ### Certification Status
@@ -139,5 +186,5 @@ com.jakewharton.timber:timber:5.0.1
 - Discover D-PAS kernel implementation
 - UnionPay QuickPass kernel implementation
 - Issuer script processing (2nd GENERATE AC)
-- Enhanced error recovery mechanisms
+- DUKPT key management for PIN encryption
 - Performance optimizations for high-volume testing
