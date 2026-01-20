@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">EMV SoftPOS Sample</string>
+    <string name="title_ready">Ready for Card</string>
+    <string name="title_processing">Processing Transaction</string>
+    <string name="title_complete">Transaction Complete</string>
+    <string name="title_error">Transaction Error</string>
+    <string name="btn_start_transaction">Start Transaction</string>
+    <string name="btn_reset">Reset</string>
+    <string name="hint_amount">Amount (cents)</string>
+    <string name="nfc_not_available">NFC is not available on this device</string>
+    <string name="nfc_disabled">Please enable NFC in system settings</string>
+    <string name="tap_card">Tap card to terminal</string>
+</resources>

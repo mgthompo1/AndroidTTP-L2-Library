@@ -1,0 +1,6 @@
+# This file should *NOT* be checked into Version Control Systems,
+# as it contains information specific to your local configuration.
+#
+# Copy this file to local.properties and update the path to your Android SDK.
+
+sdk.dir=/Users/YOUR_USERNAME/Library/Android/sdk
