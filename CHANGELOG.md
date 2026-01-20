@@ -5,6 +5,77 @@ All notable changes to the EMV SoftPOS SDK will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-01-19
+
+### Added
+
+#### American Express ExpressPay Kernel
+- `AmexContactlessKernel.kt` - Full ExpressPay implementation per EMV Book C-4
+  - EMV mode support with complete transaction flow
+  - Mag Stripe mode support for legacy cards
+  - GENERATE AC processing with proper cryptogram handling
+  - Read Application Data with multi-record support
+  - GET PROCESSING OPTIONS with proper PDOL handling
+  - Online/offline decision logic per AmEx specifications
+  - Comprehensive outcome generation (Approved, Online, Declined, Try Another Interface)
+
+- `AmexDataElements.kt` - AmEx-specific data structures
+  - Enhanced Contactless Reader Capabilities (ECR) - Tag 9F6E
+  - AmEx Application Interchange Profile (AIP) with ODA method detection
+  - Card Transaction Qualifiers (CTQ) parsing
+  - Issuer Application Data (IAD) parsing
+  - Card Verification Results (CVR) interpretation
+  - Track 2 Equivalent Data parser with PAN masking
+  - AmEx AID detection utilities
+
+#### Hardware Abstraction Layer (HAL)
+- `CardReaderInterface.kt` - NFC/contactless reader abstraction
+  - Polling with timeout and collision detection
+  - APDU transceive with proper error handling
+  - Card presence detection and disconnect
+  - Reader capabilities and status reporting
+
+- `PinPadInterface.kt` - PIN entry abstraction
+  - Hardware and software PIN pad support
+  - Multiple PIN block formats (ISO 0, 1, 2, 3, 4, VISA, ANSI)
+  - DUKPT integration with KSN tracking
+  - Display and beep control
+
+- `SecurityModuleInterface.kt` - Cryptographic operations abstraction
+  - Key management (inject, derive, delete)
+  - DUKPT key derivation
+  - Encryption/decryption (TDES, AES)
+  - MAC calculation and verification
+  - RSA operations for ODA
+  - Hardware RNG support
+
+- `TerminalFactory.kt` - Terminal auto-detection and component creation
+  - Auto-detect PAX, Castles, Ingenico, Verifone terminals
+  - SoftPOS fallback for standard Android devices
+  - Component bundling with capability reporting
+
+#### Terminal Adapters
+- `AndroidNfcCardReader.kt` - Android NFC implementation for SoftPOS
+  - Integration with Android NFC foreground dispatch
+  - IsoDep connection management
+  - Tag technology detection (NFC-A, NFC-B, ISO-DEP)
+
+- `PaxTerminalAdapter.kt` - PAX terminal integration stub
+  - Support for A920, A80, E-series, IM30
+  - Neptune SDK integration structure
+  - Hardware PIN pad and HSM access
+
+- `CastlesTerminalAdapter.kt` - Castles terminal integration stub
+  - Support for Saturn, VEGA, MP200 series
+  - Saturn SDK integration structure
+  - Hardware PIN pad and security module access
+
+### Changed
+- Updated Known Limitations - AmEx kernel now implemented
+- Updated Planned section - DUKPT and HAL now implemented
+
+---
+
 ## [1.1.0] - 2025-01-19
 
 ### Added
@@ -166,25 +237,28 @@ com.jakewharton.timber:timber:5.0.1
 
 ### Known Limitations
 
-- AmEx ExpressPay kernel: Architecture defined, implementation pending
 - Discover D-PAS kernel: Architecture defined, implementation pending
 - UnionPay QuickPass kernel: Architecture defined, implementation pending
 - 2nd Generate AC: Structure present, issuer scripts not processed
+- CA Public Keys: Test keys only, production keys need injection
+- PAX/Castles adapters: Integration stubs - requires native SDK
 
 ### Certification Status
 
 - EMVCo L2: Ready for test lab submission
 - Visa: Pending certification
 - Mastercard: Pending certification
+- American Express: Pending certification
 
 ---
 
 ## [Unreleased]
 
 ### Planned
-- AmEx ExpressPay kernel implementation
 - Discover D-PAS kernel implementation
 - UnionPay QuickPass kernel implementation
 - Issuer script processing (2nd GENERATE AC)
-- DUKPT key management for PIN encryption
+- Production CA public key injection
+- Complete PAX/Castles native SDK integration
 - Performance optimizations for high-volume testing
+- RRP (Relay Resistance Protocol) full implementation
