@@ -1,8 +1,10 @@
 package com.atlas.softpos.kernel.common
 
 import timber.log.Timber
+import java.security.MessageDigest
+import java.util.Calendar
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicReference
 
 /**
  * EMV Edge Case Handling
@@ -43,15 +45,33 @@ object EmvEdgeCases {
             var tag = data[offset].toInt() and 0xFF
             offset++
 
-            // Multi-byte tag
+            // Multi-byte tag (cap at 4 bytes total to prevent overflow attacks)
             if ((tag and 0x1F) == 0x1F) {
-                if (offset >= data.size) {
-                    return TlvValidationResult.TruncatedData(offset)
-                }
-                do {
-                    tag = (tag shl 8) or (data[offset].toInt() and 0xFF)
+                var tagByteCount = 1
+                val maxTagBytes = 4  // EMV typically uses max 3, but allow 4 for safety
+
+                while (offset < data.size && tagByteCount < maxTagBytes) {
+                    val nextByte = data[offset].toInt() and 0xFF
+                    tag = (tag shl 8) or nextByte
                     offset++
-                } while (offset < data.size && (data[offset - 1].toInt() and 0x80) != 0)
+                    tagByteCount++
+
+                    // Check if this is the last tag byte (bit 8 = 0)
+                    if ((nextByte and 0x80) == 0) {
+                        break
+                    }
+                }
+
+                // If we hit max bytes but bit 8 still set, tag is malformed
+                if (tagByteCount >= maxTagBytes && offset < data.size &&
+                    (data[offset - 1].toInt() and 0x80) != 0) {
+                    return TlvValidationResult.InvalidTag(tagStart, tag, "Tag exceeds maximum length")
+                }
+
+                // Check for truncation
+                if (offset > data.size) {
+                    return TlvValidationResult.TruncatedData(tagStart)
+                }
             }
 
             // Check for length byte
@@ -112,23 +132,48 @@ object EmvEdgeCases {
 
     /**
      * Validate PAN format
+     *
+     * PAN is BCD encoded (tag 5A): each byte contains two decimal digits (0-9),
+     * with 0xF used as padding in the final nibble for odd-length PANs.
      */
     fun validatePan(pan: ByteArray): PanValidationResult {
-        // Convert to string, removing padding F's
-        val panString = pan.joinToString("") { "%02X".format(it) }
-            .trimEnd('F')
+        if (pan.isEmpty()) {
+            return PanValidationResult.TooShort(0)
+        }
 
-        // Check length (13-19 digits)
+        // Decode BCD nibble-by-nibble, stopping at padding (0xF)
+        val digits = StringBuilder()
+        for (byte in pan) {
+            val highNibble = (byte.toInt() and 0xF0) shr 4
+            val lowNibble = byte.toInt() and 0x0F
+
+            // High nibble
+            if (highNibble == 0x0F) {
+                break  // Padding reached
+            }
+            if (highNibble > 9) {
+                return PanValidationResult.InvalidCharacters
+            }
+            digits.append(highNibble)
+
+            // Low nibble
+            if (lowNibble == 0x0F) {
+                break  // Padding reached
+            }
+            if (lowNibble > 9) {
+                return PanValidationResult.InvalidCharacters
+            }
+            digits.append(lowNibble)
+        }
+
+        val panString = digits.toString()
+
+        // Check length (13-19 digits per ISO/IEC 7812)
         if (panString.length < 13) {
             return PanValidationResult.TooShort(panString.length)
         }
         if (panString.length > 19) {
             return PanValidationResult.TooLong(panString.length)
-        }
-
-        // Check all digits
-        if (!panString.all { it.isDigit() }) {
-            return PanValidationResult.InvalidCharacters
         }
 
         // Luhn check
@@ -140,7 +185,7 @@ object EmvEdgeCases {
     }
 
     /**
-     * Luhn algorithm check
+     * Luhn algorithm (ISO/IEC 7812-1) check digit validation
      */
     private fun passesLuhnCheck(pan: String): Boolean {
         var sum = 0
@@ -165,34 +210,63 @@ object EmvEdgeCases {
 
     /**
      * Validate expiry date
+     *
+     * Expiry is BCD encoded (tag 5F24): YYMMDD format where each byte
+     * contains two BCD digits.
      */
     fun validateExpiryDate(expiry: ByteArray): ExpiryValidationResult {
-        if (expiry.size < 3) {
+        if (expiry.size < 2) {
             return ExpiryValidationResult.InvalidFormat
         }
 
-        // Format: YYMMDD (BCD)
-        val hex = expiry.joinToString("") { "%02X".format(it) }
+        // Decode BCD: YYMMDD (we only need YYMM for expiry check)
+        // Byte 0: YY, Byte 1: MM, Byte 2: DD (DD often ignored for expiry)
+        val yearHigh = (expiry[0].toInt() and 0xF0) shr 4
+        val yearLow = expiry[0].toInt() and 0x0F
+        val monthHigh = (expiry[1].toInt() and 0xF0) shr 4
+        val monthLow = expiry[1].toInt() and 0x0F
 
-        try {
-            val year = hex.substring(0, 2).toInt()
-            val month = hex.substring(2, 4).toInt()
-
-            if (month < 1 || month > 12) {
-                return ExpiryValidationResult.InvalidMonth(month)
-            }
-
-            // Check if expired (assuming 2000-2099 century)
-            val currentYear = java.util.Calendar.getInstance().get(java.util.Calendar.YEAR) % 100
-            val currentMonth = java.util.Calendar.getInstance().get(java.util.Calendar.MONTH) + 1
-
-            if (year < currentYear || (year == currentYear && month < currentMonth)) {
-                return ExpiryValidationResult.Expired(year, month)
-            }
-
-            return ExpiryValidationResult.Valid(year, month)
-        } catch (e: Exception) {
+        // Validate BCD digits (must be 0-9)
+        if (yearHigh > 9 || yearLow > 9 || monthHigh > 9 || monthLow > 9) {
             return ExpiryValidationResult.InvalidFormat
+        }
+
+        val yearYY = yearHigh * 10 + yearLow
+        val month = monthHigh * 10 + monthLow
+
+        if (month < 1 || month > 12) {
+            return ExpiryValidationResult.InvalidMonth(month)
+        }
+
+        // Get current date
+        val calendar = Calendar.getInstance()
+        val currentYear = calendar.get(Calendar.YEAR)
+        val currentMonth = calendar.get(Calendar.MONTH) + 1
+
+        // Convert 2-digit year to 4-digit year using sliding window
+        val fullYear = bcdYearToFullYear(yearYY, currentYear)
+
+        if (fullYear < currentYear || (fullYear == currentYear && month < currentMonth)) {
+            return ExpiryValidationResult.Expired(fullYear, month)
+        }
+
+        return ExpiryValidationResult.Valid(fullYear, month)
+    }
+
+    /**
+     * Convert 2-digit BCD year to 4-digit year using sliding window algorithm.
+     *
+     * Uses 80-year window: years 00-79 map to 2000-2079, years 80-99 map to 1980-1999.
+     * This handles the Y2K issue and extends validity to 2079.
+     */
+    private fun bcdYearToFullYear(yy: Int, currentYear: Int): Int {
+        val currentCentury = (currentYear / 100) * 100
+        val currentYY = currentYear % 100
+
+        return when {
+            yy >= 80 && currentYY < 80 -> currentCentury - 100 + yy
+            yy < 20 && currentYY >= 80 -> currentCentury + 100 + yy
+            else -> currentCentury + yy
         }
     }
 
@@ -271,27 +345,97 @@ object EmvEdgeCases {
     }
 
     /**
-     * Detect and handle card collision (multiple cards)
+     * Detect mixed card responses (diagnostic check)
+     *
+     * Note: True RF-level collision detection should happen at the NFC polling/activation
+     * layer before ISO-DEP activation. This is a diagnostic check for detecting if
+     * multiple responses contain different AIDs, which could indicate polling issues.
      */
-    fun detectCardCollision(responses: List<ByteArray>): Boolean {
+    fun detectMixedCardResponses(responses: List<ByteArray>): Boolean {
         if (responses.size < 2) return false
 
-        // Check for different AIDs in responses
-        val aids = responses.mapNotNull { extractAidFromResponse(it) }
+        // Check for different AIDs in responses using proper TLV parsing
+        val aids = responses.mapNotNull { extractAidFromTlv(it) }
+            .map { AidWrapper(it) }  // Wrap for proper comparison
         return aids.toSet().size > 1
     }
 
-    private fun extractAidFromResponse(response: ByteArray): ByteArray? {
-        // Simple AID extraction - look for tag 4F or 84
-        for (i in 0 until response.size - 2) {
-            if (response[i] == 0x4F.toByte() || response[i] == 0x84.toByte()) {
-                val length = response[i + 1].toInt() and 0xFF
-                if (i + 2 + length <= response.size) {
-                    return response.copyOfRange(i + 2, i + 2 + length)
+    /**
+     * Extract AID from TLV response using proper parsing
+     *
+     * Looks for tag 4F (AID) or 84 (DF Name) in parsed TLV structure.
+     */
+    private fun extractAidFromTlv(response: ByteArray): ByteArray? {
+        val tlvs = parseTlvFlat(response)
+        // Tag 4F = AID, Tag 84 = DF Name (both can identify the application)
+        return tlvs[0x4F] ?: tlvs[0x84]
+    }
+
+    /**
+     * Simple flat TLV parser for AID extraction
+     * Returns map of tag -> value (first occurrence only)
+     */
+    private fun parseTlvFlat(data: ByteArray): Map<Int, ByteArray> {
+        val result = mutableMapOf<Int, ByteArray>()
+        var offset = 0
+
+        while (offset < data.size) {
+            // Parse tag
+            if (offset >= data.size) break
+            var tag = data[offset].toInt() and 0xFF
+            offset++
+
+            // Multi-byte tag
+            if ((tag and 0x1F) == 0x1F) {
+                var tagByteCount = 1
+                while (offset < data.size && tagByteCount < 4) {
+                    val nextByte = data[offset].toInt() and 0xFF
+                    tag = (tag shl 8) or nextByte
+                    offset++
+                    tagByteCount++
+                    if ((nextByte and 0x80) == 0) break
                 }
             }
+
+            // Parse length
+            if (offset >= data.size) break
+            val lengthByte = data[offset].toInt() and 0xFF
+            offset++
+
+            val length = when {
+                lengthByte <= 0x7F -> lengthByte
+                lengthByte == 0x81 && offset < data.size -> {
+                    val len = data[offset].toInt() and 0xFF
+                    offset++
+                    len
+                }
+                lengthByte == 0x82 && offset + 1 < data.size -> {
+                    val len = ((data[offset].toInt() and 0xFF) shl 8) or
+                            (data[offset + 1].toInt() and 0xFF)
+                    offset += 2
+                    len
+                }
+                else -> break  // Invalid length
+            }
+
+            // Extract value
+            if (offset + length > data.size) break
+            if (!result.containsKey(tag)) {
+                result[tag] = data.copyOfRange(offset, offset + length)
+            }
+            offset += length
         }
-        return null
+
+        return result
+    }
+
+    // Wrapper class for ByteArray to enable proper Set comparison
+    private class AidWrapper(val aid: ByteArray) {
+        override fun equals(other: Any?): Boolean {
+            if (other !is AidWrapper) return false
+            return aid.contentEquals(other.aid)
+        }
+        override fun hashCode(): Int = aid.contentHashCode()
     }
 
     /**
@@ -329,6 +473,7 @@ sealed class TlvValidationResult {
     object Empty : TlvValidationResult()
     data class TruncatedData(val offset: Int) : TlvValidationResult()
     data class InvalidLength(val offset: Int, val lengthByte: Int) : TlvValidationResult()
+    data class InvalidTag(val offset: Int, val tag: Int, val reason: String) : TlvValidationResult()
     data class LengthExceedsData(
         val tagOffset: Int,
         val tag: Int,
@@ -431,10 +576,22 @@ sealed class RecoveryAction {
  *
  * Manages detection and recovery from transactions where the card
  * was removed before completion (anti-tearing)
+ *
+ * Security: Uses SHA-256 hash of PAN as key, never stores plaintext PAN.
+ * This complies with PCI DSS requirement 3.4 for PAN protection.
  */
 class TornTransactionHandler {
 
     private val tornTransactions = mutableMapOf<String, TornTransaction>()
+
+    /**
+     * Compute SHA-256 hash of PAN for secure storage key
+     */
+    private fun hashPan(pan: ByteArray): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val hash = digest.digest(pan)
+        return hash.joinToString("") { "%02x".format(it) }
+    }
 
     /**
      * Record a potential torn transaction
@@ -445,13 +602,13 @@ class TornTransactionHandler {
         atc: ByteArray,
         timestamp: Long = System.currentTimeMillis()
     ) {
-        val key = pan.joinToString("") { "%02X".format(it) }
+        val key = hashPan(pan)
         tornTransactions[key] = TornTransaction(
-            panHash = key.hashCode(),
+            panHashPrefix = key.take(8),  // Only store first 8 chars for logging
             atc = atc.copyOf(),
             timestamp = timestamp
         )
-        Timber.w("Recorded torn transaction for PAN hash: ${key.hashCode()}")
+        Timber.w("Recorded torn transaction for PAN hash prefix: ${key.take(8)}...")
 
         // Clean up old entries (older than 24 hours)
         cleanupOldEntries()
@@ -462,7 +619,7 @@ class TornTransactionHandler {
      */
     @Synchronized
     fun checkForTornTransaction(pan: ByteArray, atc: ByteArray): TornTransactionCheck {
-        val key = pan.joinToString("") { "%02X".format(it) }
+        val key = hashPan(pan)
         val existing = tornTransactions[key] ?: return TornTransactionCheck.NotFound
 
         // Check if ATC matches (same transaction)
@@ -488,7 +645,7 @@ class TornTransactionHandler {
      */
     @Synchronized
     fun clearTornTransaction(pan: ByteArray) {
-        val key = pan.joinToString("") { "%02X".format(it) }
+        val key = hashPan(pan)
         tornTransactions.remove(key)
     }
 
@@ -497,11 +654,32 @@ class TornTransactionHandler {
         tornTransactions.entries.removeAll { it.value.timestamp < cutoff }
     }
 
+    /**
+     * Torn transaction record
+     *
+     * Note: Uses explicit equals/hashCode due to ByteArray field.
+     * panHashPrefix is only for logging, not used for comparison.
+     */
     data class TornTransaction(
-        val panHash: Int,
+        val panHashPrefix: String,  // First 8 chars of SHA-256 hash for logging only
         val atc: ByteArray,
         val timestamp: Long
-    )
+    ) {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is TornTransaction) return false
+            return panHashPrefix == other.panHashPrefix &&
+                    atc.contentEquals(other.atc) &&
+                    timestamp == other.timestamp
+        }
+
+        override fun hashCode(): Int {
+            var result = panHashPrefix.hashCode()
+            result = 31 * result + atc.contentHashCode()
+            result = 31 * result + timestamp.hashCode()
+            return result
+        }
+    }
 
     sealed class TornTransactionCheck {
         object NotFound : TornTransactionCheck()
@@ -513,8 +691,13 @@ class TornTransactionHandler {
 
 /**
  * Card removal detector for anti-tearing
+ *
+ * @param checkIntervalMs Reserved for future use when implementing periodic
+ *        card presence polling. Currently card presence is tracked via
+ *        explicit updateCardPresence() calls from the NFC layer.
  */
 class CardRemovalDetector(
+    @Suppress("unused")
     private val checkIntervalMs: Long = 50
 ) {
     private val cardPresent = AtomicReference(true)

@@ -391,6 +391,9 @@ object EmvTags {
     /** FCI Proprietary Template */
     val FCI_PROPRIETARY = Tag(0xA5, "FCI Proprietary Template", Source.CARD, Format.CONSTRUCTED, 0, 255)
 
+    /** FCI Issuer Discretionary Data - Contains directory entries in PPSE */
+    val FCI_ISSUER_DISCRETIONARY = Tag(0xBF0C, "FCI Issuer Discretionary Data", Source.CARD, Format.CONSTRUCTED, 0, 255)
+
     /** Application Template / Directory Entry (same tag) */
     val APP_TEMPLATE = Tag(0x61, "Application Template", Source.CARD, Format.CONSTRUCTED, 0, 255)
 
@@ -534,6 +537,7 @@ object EmvTags {
         0x77 to RESPONSE_FORMAT_2,
         0x80 to RESPONSE_FORMAT_1,
         0xA5 to FCI_PROPRIETARY,
+        0xBF0C to FCI_ISSUER_DISCRETIONARY,
 
         // Kernel database tags (DFXXX)
         0xDF8101 to KERNEL_CONFIG,

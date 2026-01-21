@@ -296,23 +296,36 @@ object KnownAids {
     val EFTPOS = "A000000384".hexToByteArray()
 
     /**
-     * Get the card brand name from an AID
+     * Get the card brand name from an AID based on RID (first 5 bytes)
      */
     fun getBrandName(aid: ByteArray): String {
-        val aidHex = aid.toHexString().uppercase()
+        if (aid.size < 5) return "Unknown"
+
+        val rid = aid.copyOfRange(0, 5)
         return when {
-            aidHex.startsWith("A000000003") -> "Visa"
-            aidHex.startsWith("A000000004") -> "Mastercard"
-            aidHex.startsWith("A000000025") -> "American Express"
-            aidHex.startsWith("A0000001523") -> "Discover"
-            aidHex.startsWith("A0000003241") -> "Discover"
-            aidHex.startsWith("A000000065") -> "JCB"
-            aidHex.startsWith("A000000333") -> "UnionPay"
-            aidHex.startsWith("A000000277") -> "Interac"
-            aidHex.startsWith("A000000384") -> "EFTPOS"
+            rid.contentEquals(RID_VISA) -> "Visa"
+            rid.contentEquals(RID_MASTERCARD) -> "Mastercard"
+            rid.contentEquals(RID_AMEX) -> "American Express"
+            rid.contentEquals(RID_DISCOVER) -> "Discover"
+            rid.contentEquals(RID_DISCOVER_ZIP) -> "Discover"
+            rid.contentEquals(RID_JCB) -> "JCB"
+            rid.contentEquals(RID_UNIONPAY) -> "UnionPay"
+            rid.contentEquals(RID_INTERAC) -> "Interac"
+            rid.contentEquals(RID_EFTPOS) -> "EFTPOS"
             else -> "Unknown"
         }
     }
 
     private fun ByteArray.toHexString() = joinToString("") { "%02X".format(it) }
+
+    // Registered Application Provider Identifiers (RIDs) - 5 bytes each
+    private val RID_VISA = byteArrayOf(0xA0.toByte(), 0x00, 0x00, 0x00, 0x03)
+    private val RID_MASTERCARD = byteArrayOf(0xA0.toByte(), 0x00, 0x00, 0x00, 0x04)
+    private val RID_AMEX = byteArrayOf(0xA0.toByte(), 0x00, 0x00, 0x00, 0x25)
+    private val RID_DISCOVER = byteArrayOf(0xA0.toByte(), 0x00, 0x00, 0x01, 0x52)
+    private val RID_DISCOVER_ZIP = byteArrayOf(0xA0.toByte(), 0x00, 0x00, 0x03, 0x24)
+    private val RID_JCB = byteArrayOf(0xA0.toByte(), 0x00, 0x00, 0x00, 0x65)
+    private val RID_UNIONPAY = byteArrayOf(0xA0.toByte(), 0x00, 0x00, 0x03, 0x33)
+    private val RID_INTERAC = byteArrayOf(0xA0.toByte(), 0x00, 0x00, 0x02, 0x77)
+    private val RID_EFTPOS = byteArrayOf(0xA0.toByte(), 0x00, 0x00, 0x03, 0x84.toByte())
 }

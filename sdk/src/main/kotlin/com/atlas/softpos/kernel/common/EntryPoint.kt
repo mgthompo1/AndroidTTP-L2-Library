@@ -32,19 +32,27 @@ class EntryPoint(
     suspend fun start(): EntryPointResult {
         // Step 1: Select PPSE
         val ppseResult = selectPpse()
-        if (ppseResult is PpseResult.Error) {
-            return EntryPointResult.Error(ppseResult.message)
+
+        val candidates = when (ppseResult) {
+            is PpseResult.Success -> {
+                // Step 2a: Parse directory and build candidate list from PPSE
+                buildCandidateList(ppseResult.data)
+            }
+            is PpseResult.NotSupported -> {
+                // Step 2b: PPSE not supported - try direct AID selection
+                buildCandidateListFromDirectSelection()
+            }
+            is PpseResult.Error -> {
+                return EntryPointResult.Error(ppseResult.message)
+            }
         }
 
-        val ppseData = (ppseResult as PpseResult.Success).data
-
-        // Step 2: Parse directory and build candidate list
-        val candidates = buildCandidateList(ppseData)
         if (candidates.isEmpty()) {
             return EntryPointResult.NoSupportedApplications
         }
 
         // Step 3: Select application (highest priority matching terminal config)
+        // Lower priority value = higher priority; missing priority (0x0F) = lowest
         for (candidate in candidates.sortedBy { it.priority }) {
             val selectResult = selectApplication(candidate)
             if (selectResult is ApplicationSelectResult.Success) {
@@ -59,21 +67,59 @@ class EntryPoint(
     }
 
     /**
+     * Build candidate list via direct AID selection (fallback when PPSE not supported)
+     *
+     * Tries each supported AID in priority order and returns candidates for
+     * AIDs that successfully select.
+     */
+    private suspend fun buildCandidateListFromDirectSelection(): List<ApplicationCandidate> {
+        val candidates = mutableListOf<ApplicationCandidate>()
+
+        for ((index, supportedAid) in configuration.supportedAids.withIndex()) {
+            val command = EmvCommands.selectApplication(supportedAid)
+            val response = transceiver.transceive(command)
+
+            if (response.isSuccess) {
+                // Parse FCI to get actual AID and label
+                val fciTemplate = TlvParser.findTag(response.data, EmvTags.FCI_TEMPLATE)
+                val dfName = fciTemplate?.let {
+                    TlvParser.findTag(it.value, EmvTags.DF_NAME)?.value
+                } ?: supportedAid
+
+                val fciProprietary = fciTemplate?.let {
+                    TlvParser.findTag(it.value, EmvTags.FCI_PROPRIETARY)
+                }
+
+                val label = fciProprietary?.let {
+                    TlvParser.findTag(it.value, EmvTags.APPLICATION_LABEL)?.valueAscii()
+                } ?: KnownAids.getBrandName(dfName)
+
+                candidates.add(
+                    ApplicationCandidate(
+                        aid = dfName,
+                        label = label,
+                        priority = index,  // Use config order as priority
+                        kernelId = null
+                    )
+                )
+            }
+        }
+
+        return candidates
+    }
+
+    /**
      * Select PPSE and return the FCI template
      */
     private suspend fun selectPpse(): PpseResult {
         val command = EmvCommands.selectPpse()
         val response = transceiver.transceive(command)
 
-        if (!response.isSuccess) {
-            // Try direct AID selection if PPSE not supported
-            return PpseResult.NotSupported
-        }
-
-        return try {
+        return if (response.isSuccess) {
             PpseResult.Success(response.data)
-        } catch (e: Exception) {
-            PpseResult.Error("Failed to parse PPSE: ${e.message}")
+        } else {
+            // PPSE not supported - caller should try direct AID selection
+            PpseResult.NotSupported
         }
     }
 
@@ -98,7 +144,7 @@ class EntryPoint(
         // Parse Application Directory Entries (tag 61)
         val tlvList = TlvParser.parse(fciIssuer.value)
         for (tlv in tlvList) {
-            if (tlv.tag.hex == EmvTags.APPLICATION_DIRECTORY_ENTRY.hex) {
+            if (tlv.tag.hex == EmvTags.DIRECTORY_ENTRY.hex) {
                 val candidate = parseDirectoryEntry(tlv.value)
                 if (candidate != null && isAidSupported(candidate.aid)) {
                     candidates.add(candidate)
@@ -121,10 +167,13 @@ class EntryPoint(
         val labelTlv = tlvMap[EmvTags.APPLICATION_LABEL.hex]
         val label = labelTlv?.valueAscii() ?: KnownAids.getBrandName(aid)
 
-        val priorityTlv = tlvMap[EmvTags.APPLICATION_PRIORITY.hex]
-        val priority = priorityTlv?.value?.firstOrNull()?.toInt()?.and(0x0F) ?: 0
+        // Application Priority Indicator (tag 87)
+        // Lower value = higher priority; missing = lowest priority (0x0F)
+        val priorityTlv = tlvMap[EmvTags.APP_PRIORITY_INDICATOR.hex]
+        val priority = priorityTlv?.value?.firstOrNull()?.toInt()?.and(0x0F) ?: 0x0F
 
-        val kernelIdTlv = tlvMap["9F2A"]  // Kernel Identifier
+        // Kernel Identifier (tag 9F2A) - Mastercard specific, may not be present
+        val kernelIdTlv = tlvMap[EmvTags.KERNEL_ID.hex]
         val kernelId = kernelIdTlv?.value
 
         return ApplicationCandidate(
@@ -137,11 +186,15 @@ class EntryPoint(
 
     /**
      * Check if the AID is supported by terminal configuration
+     *
+     * Supports partial AID matching: terminal may have shorter AID (RID + PIX prefix)
+     * that matches the beginning of the card's full AID.
      */
     private fun isAidSupported(aid: ByteArray): Boolean {
-        val aidHex = aid.toHexString()
         return configuration.supportedAids.any { supportedAid ->
-            aidHex.startsWith(supportedAid.toHexString())
+            // Card AID must be at least as long as terminal AID
+            aid.size >= supportedAid.size &&
+                aid.copyOfRange(0, supportedAid.size).contentEquals(supportedAid)
         }
     }
 
@@ -176,9 +229,9 @@ class EntryPoint(
             TlvParser.findTag(it.value, EmvTags.APPLICATION_LABEL)?.valueAscii()
         } ?: candidate.label
 
-        // Extract preferred name if available
+        // Extract preferred name if available (tag 9F12)
         val preferredName = fciProprietary?.let {
-            TlvParser.findTag(it.value, EmvTags.APPLICATION_PREFERRED_NAME)?.valueAscii()
+            TlvParser.findTag(it.value, EmvTags.APP_PREFERRED_NAME)?.valueAscii()
         }
 
         // Extract language preference
@@ -198,21 +251,38 @@ class EntryPoint(
     }
 
     /**
-     * Determine which kernel to use based on AID
+     * Determine which kernel to use based on AID's RID (first 5 bytes)
+     *
+     * RID = Registered Application Provider Identifier (5 bytes)
      */
     private fun determineKernel(aid: ByteArray): KernelId {
-        val aidHex = aid.toHexString().uppercase()
+        if (aid.size < 5) return KernelId.UNKNOWN
+
+        // Extract RID (first 5 bytes) and compare
+        val rid = aid.copyOfRange(0, 5)
         return when {
-            aidHex.startsWith("A000000003") -> KernelId.VISA
-            aidHex.startsWith("A000000004") -> KernelId.MASTERCARD
-            aidHex.startsWith("A000000025") -> KernelId.AMEX
-            aidHex.startsWith("A0000001523") -> KernelId.DISCOVER
-            aidHex.startsWith("A0000003241") -> KernelId.DISCOVER
-            aidHex.startsWith("A000000065") -> KernelId.JCB
-            aidHex.startsWith("A000000333") -> KernelId.UNIONPAY
-            aidHex.startsWith("A000000277") -> KernelId.INTERAC
+            rid.contentEquals(RID_VISA) -> KernelId.VISA
+            rid.contentEquals(RID_MASTERCARD) -> KernelId.MASTERCARD
+            rid.contentEquals(RID_AMEX) -> KernelId.AMEX
+            rid.contentEquals(RID_DISCOVER) -> KernelId.DISCOVER
+            rid.contentEquals(RID_DISCOVER_ZIP) -> KernelId.DISCOVER
+            rid.contentEquals(RID_JCB) -> KernelId.JCB
+            rid.contentEquals(RID_UNIONPAY) -> KernelId.UNIONPAY
+            rid.contentEquals(RID_INTERAC) -> KernelId.INTERAC
             else -> KernelId.UNKNOWN
         }
+    }
+
+    companion object {
+        // Registered Application Provider Identifiers (RIDs) - 5 bytes each
+        private val RID_VISA = byteArrayOf(0xA0.toByte(), 0x00, 0x00, 0x00, 0x03)
+        private val RID_MASTERCARD = byteArrayOf(0xA0.toByte(), 0x00, 0x00, 0x00, 0x04)
+        private val RID_AMEX = byteArrayOf(0xA0.toByte(), 0x00, 0x00, 0x00, 0x25)
+        private val RID_DISCOVER = byteArrayOf(0xA0.toByte(), 0x00, 0x00, 0x01, 0x52)
+        private val RID_DISCOVER_ZIP = byteArrayOf(0xA0.toByte(), 0x00, 0x00, 0x03, 0x24)
+        private val RID_JCB = byteArrayOf(0xA0.toByte(), 0x00, 0x00, 0x00, 0x65)
+        private val RID_UNIONPAY = byteArrayOf(0xA0.toByte(), 0x00, 0x00, 0x03, 0x33)
+        private val RID_INTERAC = byteArrayOf(0xA0.toByte(), 0x00, 0x00, 0x02, 0x77)
     }
 }
 
