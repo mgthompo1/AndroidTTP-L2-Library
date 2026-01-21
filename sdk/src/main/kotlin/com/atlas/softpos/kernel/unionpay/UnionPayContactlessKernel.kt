@@ -697,6 +697,247 @@ class UnionPayContactlessKernel(
         }.toMap()
     }
 
+    // ==================== ONLINE RESPONSE PROCESSING ====================
+
+    /**
+     * Process online authorization response from issuer
+     */
+    suspend fun processOnlineResponse(
+        onlineResponse: UnionPayOnlineAuthResponse,
+        previousOutcome: UnionPayKernelOutcome
+    ): UnionPayOnlineResponseResult {
+        try {
+            // Step 1: Verify ARPC if provided
+            if (onlineResponse.arpc != null && onlineResponse.arc != null) {
+                val arpcValid = verifyArpc(
+                    arqc = previousOutcome.cryptogram ?: byteArrayOf(),
+                    arpc = onlineResponse.arpc,
+                    arc = onlineResponse.arc
+                )
+
+                if (!arpcValid) {
+                    val tvr = transactionData["95"] ?: ByteArray(5)
+                    tvr[4] = (tvr[4].toInt() or 0x40).toByte()
+                    transactionData["95"] = tvr
+                }
+            }
+
+            // Step 2: Execute issuer scripts before 2nd GENERATE AC (tag 71)
+            val script71Results = mutableListOf<UnionPayIssuerScriptResult>()
+            onlineResponse.issuerScripts71?.let { scripts ->
+                for (script in scripts) {
+                    val result = executeIssuerScript(script, true)
+                    script71Results.add(result)
+                    if (!result.success && result.abortTransaction) {
+                        return UnionPayOnlineResponseResult.ScriptFailed(
+                            scriptResults = script71Results,
+                            failedScriptTag = "71"
+                        )
+                    }
+                }
+            }
+
+            // Step 3: Perform second GENERATE AC
+            val secondAcResult = performSecondGenerateAc(onlineResponse.approved)
+
+            // Step 4: Execute issuer scripts after 2nd GENERATE AC (tag 72)
+            val script72Results = mutableListOf<UnionPayIssuerScriptResult>()
+            onlineResponse.issuerScripts72?.let { scripts ->
+                for (script in scripts) {
+                    val result = executeIssuerScript(script, false)
+                    script72Results.add(result)
+                }
+            }
+
+            val allScriptResults = script71Results + script72Results
+
+            return when (secondAcResult) {
+                is UnionPaySecondAcResult.Approved -> UnionPayOnlineResponseResult.Approved(
+                    cryptogram = secondAcResult.cryptogram,
+                    scriptResults = allScriptResults
+                )
+                is UnionPaySecondAcResult.Declined -> UnionPayOnlineResponseResult.Declined(
+                    cryptogram = secondAcResult.cryptogram,
+                    reason = secondAcResult.reason,
+                    scriptResults = allScriptResults
+                )
+                is UnionPaySecondAcResult.Error -> UnionPayOnlineResponseResult.Error(
+                    reason = secondAcResult.message,
+                    scriptResults = allScriptResults
+                )
+            }
+
+        } catch (e: Exception) {
+            return UnionPayOnlineResponseResult.Error(
+                reason = "Processing error: ${e.message}",
+                scriptResults = emptyList()
+            )
+        }
+    }
+
+    private fun verifyArpc(arqc: ByteArray, arpc: ByteArray, arc: ByteArray): Boolean {
+        val sessionKey = deriveSessionKeyFromCardData() ?: return false
+
+        val arcPadded = ByteArray(8)
+        System.arraycopy(arc, 0, arcPadded, 0, minOf(arc.size, 2))
+
+        val xorResult = ByteArray(8)
+        for (i in 0 until 8) {
+            xorResult[i] = (arqc.getOrElse(i) { 0 }.toInt() xor arcPadded[i].toInt()).toByte()
+        }
+
+        return try {
+            val cipher = javax.crypto.Cipher.getInstance("DESede/ECB/NoPadding")
+            val expandedKey = if (sessionKey.size == 16) {
+                sessionKey + sessionKey.copyOfRange(0, 8)
+            } else {
+                sessionKey
+            }
+            val keySpec = javax.crypto.spec.SecretKeySpec(expandedKey, "DESede")
+            cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, keySpec)
+            val computedArpc = cipher.doFinal(xorResult)
+
+            computedArpc.copyOfRange(0, arpc.size).contentEquals(arpc)
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private suspend fun executeIssuerScript(script: ByteArray, isPreAc: Boolean): UnionPayIssuerScriptResult {
+        try {
+            val commands = parseIssuerScriptCommands(script)
+            if (commands.isEmpty()) {
+                return UnionPayIssuerScriptResult(success = true, sw = 0x9000, abortTransaction = false)
+            }
+
+            var lastSw = 0x9000
+            for (commandData in commands) {
+                if (commandData.size < 4) continue
+
+                val command = CommandApdu(
+                    cla = commandData[0],
+                    ins = commandData[1],
+                    p1 = commandData[2],
+                    p2 = commandData[3],
+                    data = if (commandData.size > 5) {
+                        val lc = commandData[4].toInt() and 0xFF
+                        commandData.copyOfRange(5, minOf(5 + lc, commandData.size))
+                    } else null,
+                    le = null
+                )
+
+                val response = transceiver.transceive(command)
+                lastSw = response.sw
+
+                if (!response.isSuccess) {
+                    val tvr = transactionData["95"] ?: ByteArray(5)
+                    if (isPreAc) {
+                        tvr[4] = (tvr[4].toInt() or 0x20).toByte()
+                    } else {
+                        tvr[4] = (tvr[4].toInt() or 0x10).toByte()
+                    }
+                    transactionData["95"] = tvr
+
+                    return UnionPayIssuerScriptResult(
+                        success = false,
+                        sw = lastSw,
+                        abortTransaction = isPreAc && lastSw == 0x6985
+                    )
+                }
+            }
+
+            return UnionPayIssuerScriptResult(success = true, sw = lastSw, abortTransaction = false)
+
+        } catch (e: Exception) {
+            return UnionPayIssuerScriptResult(success = false, sw = 0x6F00, abortTransaction = false)
+        }
+    }
+
+    private fun parseIssuerScriptCommands(script: ByteArray): List<ByteArray> {
+        val commands = mutableListOf<ByteArray>()
+        var offset = 0
+
+        while (offset < script.size) {
+            if (script[offset] != 0x86.toByte()) {
+                offset++
+                continue
+            }
+            offset++
+
+            if (offset >= script.size) break
+
+            var length = script[offset].toInt() and 0xFF
+            offset++
+
+            if (length == 0x81) {
+                if (offset >= script.size) break
+                length = script[offset].toInt() and 0xFF
+                offset++
+            }
+
+            if (offset + length > script.size) break
+
+            commands.add(script.copyOfRange(offset, offset + length))
+            offset += length
+        }
+
+        return commands
+    }
+
+    private suspend fun performSecondGenerateAc(approved: Boolean): UnionPaySecondAcResult {
+        val cdol2 = transactionData["8D"] ?: transactionData["8C"] ?: getDefaultCdol1()
+        val cdolData = buildCdolData(cdol2)
+
+        val p1 = if (approved) 0x40.toByte() else 0x00.toByte()
+
+        val command = CommandApdu(
+            cla = 0x80.toByte(),
+            ins = 0xAE.toByte(),
+            p1 = p1,
+            p2 = 0x00,
+            data = cdolData,
+            le = 0
+        )
+
+        val response = transceiver.transceive(command)
+
+        if (!response.isSuccess) {
+            return UnionPaySecondAcResult.Error("Second GENERATE AC failed")
+        }
+
+        val tlvMap = if (response.data.isNotEmpty()) {
+            TlvParser.parseRecursive(response.data).associateBy({ it.tag.hex }, { it.value })
+        } else {
+            mapOf()
+        }
+
+        val cid = tlvMap["9F27"]?.firstOrNull()?.toInt()?.and(0xFF) ?: 0x00
+        val cryptogramType = (cid and 0xC0) shr 6
+        val cryptogram = tlvMap["9F26"]
+
+        return when (cryptogramType) {
+            1 -> UnionPaySecondAcResult.Approved(cryptogram)
+            0 -> UnionPaySecondAcResult.Declined(cryptogram, "Card declined after online auth")
+            else -> UnionPaySecondAcResult.Declined(cryptogram, "Unexpected response")
+        }
+    }
+
+    private fun deriveSessionKeyFromCardData(): ByteArray? {
+        val atc = transactionData["9F36"]
+        val pan = transactionData["5A"]
+        val psn = transactionData["5F34"]
+
+        if (atc == null || pan == null) return null
+
+        val keyMaterial = ByteArray(16)
+        val panBytes = pan.copyOfRange(0, minOf(8, pan.size))
+        System.arraycopy(panBytes, 0, keyMaterial, 0, panBytes.size)
+        System.arraycopy(atc, 0, keyMaterial, 8, minOf(2, atc.size))
+        psn?.let { System.arraycopy(it, 0, keyMaterial, 10, minOf(1, it.size)) }
+
+        return keyMaterial
+    }
+
     private fun Long.toAmountBytes(): ByteArray {
         val hex = "%012d".format(this)
         return hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
@@ -786,3 +1027,64 @@ data class UnionPayKernelConfiguration(
     val noCvmAllowed: Boolean = true,
     val electronicCashSupported: Boolean = true
 )
+
+// ==================== ONLINE RESPONSE DATA CLASSES ====================
+
+data class UnionPayOnlineAuthResponse(
+    val approved: Boolean,
+    val arc: ByteArray? = null,
+    val arpc: ByteArray? = null,
+    val issuerScripts71: List<ByteArray>? = null,
+    val issuerScripts72: List<ByteArray>? = null,
+    val issuerAuthData: ByteArray? = null
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is UnionPayOnlineAuthResponse) return false
+        return approved == other.approved &&
+                arc.contentEquals(other.arc) &&
+                arpc.contentEquals(other.arpc)
+    }
+
+    override fun hashCode(): Int {
+        var result = approved.hashCode()
+        result = 31 * result + (arc?.contentHashCode() ?: 0)
+        result = 31 * result + (arpc?.contentHashCode() ?: 0)
+        return result
+    }
+}
+
+sealed class UnionPayOnlineResponseResult {
+    data class Approved(
+        val cryptogram: ByteArray?,
+        val scriptResults: List<UnionPayIssuerScriptResult>
+    ) : UnionPayOnlineResponseResult()
+
+    data class Declined(
+        val cryptogram: ByteArray?,
+        val reason: String,
+        val scriptResults: List<UnionPayIssuerScriptResult>
+    ) : UnionPayOnlineResponseResult()
+
+    data class ScriptFailed(
+        val scriptResults: List<UnionPayIssuerScriptResult>,
+        val failedScriptTag: String
+    ) : UnionPayOnlineResponseResult()
+
+    data class Error(
+        val reason: String,
+        val scriptResults: List<UnionPayIssuerScriptResult>
+    ) : UnionPayOnlineResponseResult()
+}
+
+data class UnionPayIssuerScriptResult(
+    val success: Boolean,
+    val sw: Int,
+    val abortTransaction: Boolean
+)
+
+sealed class UnionPaySecondAcResult {
+    data class Approved(val cryptogram: ByteArray?) : UnionPaySecondAcResult()
+    data class Declined(val cryptogram: ByteArray?, val reason: String) : UnionPaySecondAcResult()
+    data class Error(val message: String) : UnionPaySecondAcResult()
+}

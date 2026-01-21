@@ -1058,6 +1058,378 @@ class VisaContactlessKernel(
         }
     }
 
+    // ==================== ONLINE RESPONSE PROCESSING ====================
+
+    /**
+     * Process online authorization response from issuer
+     *
+     * This handles:
+     * 1. ARPC verification (if provided)
+     * 2. Issuer script execution (tags 71/72)
+     * 3. Second GENERATE AC for final transaction result
+     *
+     * @param onlineResponse Response from issuer/acquirer
+     * @param previousAuthData Authorization data from initial GENERATE AC
+     * @return Result of online processing
+     */
+    suspend fun processOnlineResponse(
+        onlineResponse: VisaOnlineAuthResponse,
+        previousAuthData: VisaAuthorizationData
+    ): VisaOnlineResponseResult {
+        Timber.d("=== VISA ONLINE RESPONSE PROCESSING ===")
+        Timber.d("Online approved: ${onlineResponse.approved}")
+
+        try {
+            // Step 1: Verify ARPC if provided
+            if (onlineResponse.arpc != null && onlineResponse.arc != null) {
+                val arpcValid = verifyArpc(
+                    arqc = previousAuthData.applicationCryptogram.hexToByteArray(),
+                    arpc = onlineResponse.arpc,
+                    arc = onlineResponse.arc
+                )
+
+                if (!arpcValid) {
+                    tvr.issuerAuthFailed = true
+                    Timber.w("ARPC verification failed")
+                    // Continue processing - card will decide final outcome
+                }
+            }
+
+            // Step 2: Execute issuer scripts before second GENERATE AC (tag 71)
+            val script71Results = mutableListOf<VisaIssuerScriptResult>()
+            onlineResponse.issuerScripts71?.let { scripts ->
+                Timber.d("Processing ${scripts.size} tag 71 issuer scripts")
+                for (script in scripts) {
+                    val result = executeIssuerScript(script)
+                    script71Results.add(result)
+                    if (!result.success && result.abortTransaction) {
+                        // Tag 71 script failure can abort transaction
+                        return VisaOnlineResponseResult.ScriptFailed(
+                            scriptResults = script71Results,
+                            failedScriptTag = "71",
+                            tvr = tvr.toBytes().toHexString()
+                        )
+                    }
+                }
+            }
+
+            // Step 3: Perform second GENERATE AC
+            val secondAcResult = performSecondGenerateAc(onlineResponse.approved)
+
+            // Step 4: Execute issuer scripts after second GENERATE AC (tag 72)
+            val script72Results = mutableListOf<VisaIssuerScriptResult>()
+            onlineResponse.issuerScripts72?.let { scripts ->
+                Timber.d("Processing ${scripts.size} tag 72 issuer scripts")
+                for (script in scripts) {
+                    val result = executeIssuerScript(script)
+                    script72Results.add(result)
+                    // Tag 72 scripts don't abort - they are for card updates
+                }
+            }
+
+            val allScriptResults = script71Results + script72Results
+
+            // Return final result
+            return when (secondAcResult) {
+                is VisaSecondAcResult.Approved -> VisaOnlineResponseResult.Approved(
+                    cryptogram = secondAcResult.cryptogram,
+                    cryptogramType = "TC",
+                    scriptResults = allScriptResults,
+                    tvr = tvr.toBytes().toHexString()
+                )
+                is VisaSecondAcResult.Declined -> VisaOnlineResponseResult.Declined(
+                    cryptogram = secondAcResult.cryptogram,
+                    reason = secondAcResult.reason,
+                    scriptResults = allScriptResults,
+                    tvr = tvr.toBytes().toHexString()
+                )
+                is VisaSecondAcResult.Error -> VisaOnlineResponseResult.Error(
+                    reason = secondAcResult.message,
+                    scriptResults = allScriptResults,
+                    tvr = tvr.toBytes().toHexString()
+                )
+            }
+
+        } catch (e: Exception) {
+            Timber.e(e, "Online response processing failed")
+            return VisaOnlineResponseResult.Error(
+                reason = "Processing error: ${e.message}",
+                scriptResults = emptyList(),
+                tvr = tvr.toBytes().toHexString()
+            )
+        }
+    }
+
+    /**
+     * Verify ARPC (Authorization Response Cryptogram)
+     *
+     * Visa uses ARPC Method 1:
+     * ARPC = DES3(ARQC XOR ARC || padding)
+     *
+     * The ARPC proves the issuer received and approved the ARQC.
+     */
+    private fun verifyArpc(arqc: ByteArray, arpc: ByteArray, arc: ByteArray): Boolean {
+        Timber.d("Verifying ARPC")
+
+        // Get session key for verification
+        // In production, this would be derived from card-specific keys
+        val sessionKey = deriveSessionKeyFromCardData() ?: run {
+            Timber.w("Could not derive session key for ARPC verification")
+            return false
+        }
+
+        // ARPC Method 1 verification
+        // ARPC = 3DES_ENC(SK, ARQC XOR (ARC || 0x00000000))
+        val arcPadded = ByteArray(8)
+        System.arraycopy(arc, 0, arcPadded, 0, minOf(arc.size, 2))
+
+        val xorResult = ByteArray(8)
+        for (i in 0 until 8) {
+            xorResult[i] = (arqc.getOrElse(i) { 0 }.toInt() xor arcPadded[i].toInt()).toByte()
+        }
+
+        return try {
+            val cipher = javax.crypto.Cipher.getInstance("DESede/ECB/NoPadding")
+            val expandedKey = if (sessionKey.size == 16) {
+                sessionKey + sessionKey.copyOfRange(0, 8)
+            } else {
+                sessionKey
+            }
+            val keySpec = javax.crypto.spec.SecretKeySpec(expandedKey, "DESede")
+            cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, keySpec)
+            val computedArpc = cipher.doFinal(xorResult)
+
+            val matches = computedArpc.copyOfRange(0, arpc.size).contentEquals(arpc)
+            Timber.d("ARPC verification: ${if (matches) "PASSED" else "FAILED"}")
+            matches
+        } catch (e: Exception) {
+            Timber.e(e, "ARPC calculation error")
+            false
+        }
+    }
+
+    /**
+     * Execute an issuer script command
+     *
+     * Issuer scripts (tags 71/72) contain APDU commands to update the card.
+     * Format: 71/72 | Length | Script commands...
+     * Each command: Tag 86 | Length | APDU command
+     */
+    private suspend fun executeIssuerScript(script: ByteArray): VisaIssuerScriptResult {
+        Timber.d("Executing issuer script (${script.size} bytes)")
+
+        try {
+            // Parse script - may contain multiple tag 86 commands
+            val commands = parseIssuerScriptCommands(script)
+            if (commands.isEmpty()) {
+                Timber.w("No commands found in issuer script")
+                return VisaIssuerScriptResult(success = true, sw = 0x9000, abortTransaction = false)
+            }
+
+            var lastSw = 0x9000
+            for (commandData in commands) {
+                // Build APDU from script data
+                if (commandData.size < 4) {
+                    Timber.w("Script command too short")
+                    continue
+                }
+
+                val command = CommandApdu(
+                    cla = commandData[0],
+                    ins = commandData[1],
+                    p1 = commandData[2],
+                    p2 = commandData[3],
+                    data = if (commandData.size > 5) {
+                        val lc = commandData[4].toInt() and 0xFF
+                        commandData.copyOfRange(5, minOf(5 + lc, commandData.size))
+                    } else null,
+                    le = null
+                )
+
+                val response = transceiver.transceive(command)
+                lastSw = response.sw
+
+                // Check for specific error conditions
+                if (!response.isSuccess) {
+                    Timber.w("Script command failed: SW=%04X", lastSw)
+
+                    // 6985 = Conditions not satisfied (may warrant abort)
+                    // 6984 = Referenced data not found
+                    // 6A80 = Incorrect parameters in data field
+                    val abortRequired = lastSw == 0x6985
+
+                    // Update TVR to indicate script processing failed
+                    if (isTag71Script(script)) {
+                        tvr.scriptFailedBeforeAc = true
+                    } else {
+                        tvr.scriptFailedAfterAc = true
+                    }
+
+                    return VisaIssuerScriptResult(
+                        success = false,
+                        sw = lastSw,
+                        abortTransaction = abortRequired && isTag71Script(script)
+                    )
+                }
+            }
+
+            return VisaIssuerScriptResult(success = true, sw = lastSw, abortTransaction = false)
+
+        } catch (e: Exception) {
+            Timber.e(e, "Error executing issuer script")
+            if (isTag71Script(script)) {
+                tvr.scriptFailedBeforeAc = true
+            } else {
+                tvr.scriptFailedAfterAc = true
+            }
+            return VisaIssuerScriptResult(success = false, sw = 0x6F00, abortTransaction = false)
+        }
+    }
+
+    /**
+     * Parse issuer script commands from tag 71/72 data
+     */
+    private fun parseIssuerScriptCommands(script: ByteArray): List<ByteArray> {
+        val commands = mutableListOf<ByteArray>()
+
+        var offset = 0
+        while (offset < script.size) {
+            // Look for tag 86 (Issuer Script Command)
+            if (script[offset] != 0x86.toByte()) {
+                offset++
+                continue
+            }
+            offset++
+
+            if (offset >= script.size) break
+
+            // Parse length
+            var length = script[offset].toInt() and 0xFF
+            offset++
+
+            if (length == 0x81) {
+                // Two-byte length form
+                if (offset >= script.size) break
+                length = script[offset].toInt() and 0xFF
+                offset++
+            }
+
+            if (offset + length > script.size) break
+
+            val command = script.copyOfRange(offset, offset + length)
+            commands.add(command)
+            offset += length
+        }
+
+        return commands
+    }
+
+    /**
+     * Check if script is tag 71 (before 2nd AC)
+     */
+    private fun isTag71Script(script: ByteArray): Boolean {
+        return script.isNotEmpty() && script[0] == 0x71.toByte()
+    }
+
+    /**
+     * Perform second GENERATE AC after online authorization
+     */
+    private suspend fun performSecondGenerateAc(approved: Boolean): VisaSecondAcResult {
+        Timber.d("Performing second GENERATE AC, approved=$approved")
+
+        // Get CDOL2 (or use CDOL1 if not present)
+        val cdol2 = cardData["8D"]?.value ?: cardData["8C"]?.value
+        if (cdol2 == null) {
+            return VisaSecondAcResult.Error("Missing CDOL2/CDOL1 for second AC")
+        }
+
+        // Update TVR
+        dataStore.set(0x95, tvr.toBytes())
+
+        // Build CDOL2 data
+        val cdolData = DolParser.buildDolData(cdol2, dataStore)
+
+        // P1: Request TC if approved, AAC if declined
+        // Bits 8-7: 01 = TC, 00 = AAC
+        val p1: Byte = if (approved) 0x40.toByte() else 0x00.toByte()
+
+        val command = CommandApdu(
+            cla = 0x80.toByte(),
+            ins = 0xAE.toByte(),
+            p1 = p1,
+            p2 = 0x00,
+            data = cdolData,
+            le = 0x00
+        )
+
+        val response = transceiver.transceive(command)
+
+        if (!response.isSuccess) {
+            Timber.e("Second GENERATE AC failed: SW=%04X", response.sw)
+            return VisaSecondAcResult.Error("Second GENERATE AC failed: %04X".format(response.sw))
+        }
+
+        // Parse response
+        val acResponse = parseGenerateAcResponse(response.data)
+        if (acResponse == null) {
+            return VisaSecondAcResult.Error("Failed to parse second AC response")
+        }
+
+        val cryptogramHex = acResponse.cryptogram.toHexString()
+
+        return when (acResponse.cryptogramType) {
+            CryptogramType.TC -> {
+                Timber.d("Card returned TC - transaction approved")
+                VisaSecondAcResult.Approved(cryptogramHex)
+            }
+            CryptogramType.AAC -> {
+                Timber.d("Card returned AAC - transaction declined")
+                VisaSecondAcResult.Declined(cryptogramHex, "Card declined after online auth")
+            }
+            else -> {
+                Timber.w("Unexpected cryptogram type in second AC: ${acResponse.cryptogramType}")
+                VisaSecondAcResult.Declined(cryptogramHex, "Unexpected response")
+            }
+        }
+    }
+
+    /**
+     * Derive session key from card data for ARPC verification
+     *
+     * Note: In production, this requires proper key management with
+     * derived session keys. This is a simplified implementation.
+     */
+    private fun deriveSessionKeyFromCardData(): ByteArray? {
+        // Session key derivation requires card master key and ATC
+        // This is typically handled by the issuer/acquirer HSM
+        // For local verification, we would need the card's UDK
+
+        val atc = cardData["9F36"]?.value
+        val pan = cardData["5A"]?.value
+        val psn = cardData["5F34"]?.value
+
+        if (atc == null || pan == null) {
+            return null
+        }
+
+        // Simplified key derivation - not cryptographically secure
+        // Production would use proper EMV session key derivation
+        Timber.w("Using simplified session key derivation - production should use proper key management")
+
+        val keyMaterial = ByteArray(16)
+        val panBytes = pan.copyOfRange(0, minOf(8, pan.size))
+        System.arraycopy(panBytes, 0, keyMaterial, 0, panBytes.size)
+        System.arraycopy(atc, 0, keyMaterial, 8, minOf(2, atc.size))
+        psn?.let { System.arraycopy(it, 0, keyMaterial, 10, minOf(1, it.size)) }
+
+        return keyMaterial
+    }
+
+    private fun String.hexToByteArray(): ByteArray {
+        require(length % 2 == 0) { "Hex string must have even length" }
+        return chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+    }
+
     /**
      * Convert 2-digit BCD year to 4-digit year using sliding window algorithm.
      *
@@ -1283,3 +1655,81 @@ data class VisaTransactionData(
     val cashbackAmount: Long? = null,
     val transactionType: Byte = 0x00  // Purchase
 )
+
+// ==================== ONLINE RESPONSE DATA CLASSES ====================
+
+/**
+ * Online authorization response from issuer
+ */
+data class VisaOnlineAuthResponse(
+    val approved: Boolean,
+    val arc: ByteArray? = null,           // Authorization Response Code (2 bytes)
+    val arpc: ByteArray? = null,          // Authorization Response Cryptogram
+    val issuerScripts71: List<ByteArray>? = null,  // Scripts before 2nd GENERATE AC
+    val issuerScripts72: List<ByteArray>? = null,  // Scripts after 2nd GENERATE AC
+    val issuerAuthData: ByteArray? = null // Issuer Authentication Data
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is VisaOnlineAuthResponse) return false
+        return approved == other.approved &&
+                arc.contentEquals(other.arc) &&
+                arpc.contentEquals(other.arpc)
+    }
+
+    override fun hashCode(): Int {
+        var result = approved.hashCode()
+        result = 31 * result + (arc?.contentHashCode() ?: 0)
+        result = 31 * result + (arpc?.contentHashCode() ?: 0)
+        return result
+    }
+}
+
+/**
+ * Result of processing online authorization response
+ */
+sealed class VisaOnlineResponseResult {
+    data class Approved(
+        val cryptogram: String,
+        val cryptogramType: String,
+        val scriptResults: List<VisaIssuerScriptResult>,
+        val tvr: String
+    ) : VisaOnlineResponseResult()
+
+    data class Declined(
+        val cryptogram: String,
+        val reason: String,
+        val scriptResults: List<VisaIssuerScriptResult>,
+        val tvr: String
+    ) : VisaOnlineResponseResult()
+
+    data class ScriptFailed(
+        val scriptResults: List<VisaIssuerScriptResult>,
+        val failedScriptTag: String,
+        val tvr: String
+    ) : VisaOnlineResponseResult()
+
+    data class Error(
+        val reason: String,
+        val scriptResults: List<VisaIssuerScriptResult>,
+        val tvr: String
+    ) : VisaOnlineResponseResult()
+}
+
+/**
+ * Result of issuer script execution
+ */
+data class VisaIssuerScriptResult(
+    val success: Boolean,
+    val sw: Int,
+    val abortTransaction: Boolean
+)
+
+/**
+ * Result of second GENERATE AC
+ */
+sealed class VisaSecondAcResult {
+    data class Approved(val cryptogram: String) : VisaSecondAcResult()
+    data class Declined(val cryptogram: String, val reason: String) : VisaSecondAcResult()
+    data class Error(val message: String) : VisaSecondAcResult()
+}

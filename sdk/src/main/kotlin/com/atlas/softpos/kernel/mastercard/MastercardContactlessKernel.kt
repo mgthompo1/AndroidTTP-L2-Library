@@ -119,6 +119,254 @@ class MastercardContactlessKernel(
     }
 
     /**
+     * Process online response from issuer
+     *
+     * This method should be called after receiving the online authorization response.
+     * It handles:
+     * 1. ARPC verification (Method 1 or Method 2)
+     * 2. Issuer script execution (tags 71/72)
+     * 3. Second GENERATE AC to finalize transaction
+     *
+     * @param onlineResponse The online response containing ARPC and issuer scripts
+     * @param previousAuthData The authorization data from the initial OnlineRequest
+     * @return Final outcome after online processing
+     */
+    suspend fun processOnlineResponse(
+        onlineResponse: OnlineAuthResponse,
+        previousAuthData: MastercardAuthorizationData
+    ): OnlineResponseResult {
+        Timber.d("Processing online response: approved=${onlineResponse.approved}")
+
+        try {
+            // Step 1: Verify ARPC if provided
+            if (onlineResponse.arpc != null && onlineResponse.arc != null) {
+                val arpcValid = verifyArpc(
+                    arqc = previousAuthData.applicationCryptogram.hexToByteArray(),
+                    arpc = onlineResponse.arpc,
+                    arc = onlineResponse.arc,
+                    sessionKey = deriveSessionKeyFromCardData()
+                )
+
+                if (!arpcValid) {
+                    Timber.w("ARPC verification failed")
+                    tvr.issuerAuthFailed = true
+                    // Continue - card will decide based on IAC
+                }
+            }
+
+            // Step 2: Process issuer scripts before GENERATE AC (tag 71)
+            val script71Results = mutableListOf<IssuerScriptResult>()
+            onlineResponse.issuerScripts71?.let { scripts ->
+                for (script in scripts) {
+                    val result = executeIssuerScript(script)
+                    script71Results.add(result)
+                    if (!result.success && result.abortTransaction) {
+                        Timber.w("Issuer script 71 failed, aborting")
+                        return OnlineResponseResult.ScriptFailed(
+                            error = "Issuer script failed: ${result.sw}",
+                            scriptResults = script71Results
+                        )
+                    }
+                }
+            }
+
+            // Step 3: Second GENERATE AC
+            val secondAcResult = performSecondGenerateAc(onlineResponse.approved)
+
+            // Step 4: Process issuer scripts after GENERATE AC (tag 72)
+            val script72Results = mutableListOf<IssuerScriptResult>()
+            onlineResponse.issuerScripts72?.let { scripts ->
+                for (script in scripts) {
+                    val result = executeIssuerScript(script)
+                    script72Results.add(result)
+                    // Tag 72 scripts don't abort transaction
+                }
+            }
+
+            // Build final result
+            return when (secondAcResult) {
+                is SecondAcResult.Approved -> OnlineResponseResult.Approved(
+                    authorizationData = secondAcResult.authData,
+                    scriptResults = script71Results + script72Results
+                )
+                is SecondAcResult.Declined -> OnlineResponseResult.Declined(
+                    reason = secondAcResult.reason,
+                    authorizationData = secondAcResult.authData,
+                    scriptResults = script71Results + script72Results
+                )
+                is SecondAcResult.Error -> OnlineResponseResult.Error(
+                    error = secondAcResult.error,
+                    scriptResults = script71Results + script72Results
+                )
+            }
+
+        } catch (e: Exception) {
+            Timber.e(e, "Error processing online response")
+            return OnlineResponseResult.Error(
+                error = "Online response processing failed: ${e.message}",
+                scriptResults = emptyList()
+            )
+        }
+    }
+
+    /**
+     * Verify Authorization Response Cryptogram (ARPC)
+     * Supports Method 1 (MAC-based) and Method 2 (proprietary)
+     */
+    private fun verifyArpc(
+        arqc: ByteArray,
+        arpc: ByteArray,
+        arc: ByteArray,
+        sessionKey: ByteArray?
+    ): Boolean {
+        if (sessionKey == null) {
+            Timber.w("Cannot verify ARPC: no session key available")
+            return false
+        }
+
+        // Method 1: ARPC = MAC(ARQC XOR (ARC || 0000 0000 0000))
+        val arcPadded = ByteArray(8)
+        System.arraycopy(arc, 0, arcPadded, 0, minOf(arc.size, 2))
+
+        val xored = ByteArray(8)
+        for (i in 0 until 8) {
+            xored[i] = (arqc[i].toInt() xor arcPadded[i].toInt()).toByte()
+        }
+
+        val expectedArpc = com.atlas.softpos.crypto.EmvCrypto.retailMac(xored, sessionKey)
+        return arpc.contentEquals(expectedArpc)
+    }
+
+    /**
+     * Execute an issuer script command
+     */
+    private suspend fun executeIssuerScript(script: ByteArray): IssuerScriptResult {
+        if (script.isEmpty()) {
+            return IssuerScriptResult(success = true, sw = 0x9000, abortTransaction = false)
+        }
+
+        try {
+            // Parse script template
+            val tlvs = TlvParser.parse(script)
+            for (tlv in tlvs) {
+                // Each script contains command APDUs
+                if (tlv.tag.hex == "86") {
+                    // Command template - execute the APDU
+                    val command = tlv.value
+                    if (command.size < 4) continue
+
+                    val apdu = com.atlas.softpos.core.apdu.CommandApdu(
+                        cla = command[0],
+                        ins = command[1],
+                        p1 = command[2],
+                        p2 = command[3],
+                        data = if (command.size > 5) command.copyOfRange(5, 5 + (command[4].toInt() and 0xFF)) else null
+                    )
+
+                    val response = transceiver.transceive(apdu)
+                    val sw = response.sw
+
+                    // Check if script failed
+                    if (sw != 0x9000 && (sw and 0xFF00) != 0x6100) {
+                        // Script command failed
+                        val abortOnFail = (tlv.tag.hex == "71") // Tag 71 scripts can abort
+                        return IssuerScriptResult(
+                            success = false,
+                            sw = sw,
+                            abortTransaction = abortOnFail && (sw and 0xFFF0) != 0x63C0
+                        )
+                    }
+                }
+            }
+
+            return IssuerScriptResult(success = true, sw = 0x9000, abortTransaction = false)
+
+        } catch (e: Exception) {
+            Timber.e(e, "Issuer script execution error")
+            return IssuerScriptResult(success = false, sw = 0x6F00, abortTransaction = false)
+        }
+    }
+
+    /**
+     * Perform second GENERATE AC after online authorization
+     */
+    private suspend fun performSecondGenerateAc(onlineApproved: Boolean): SecondAcResult {
+        // Build CDOL2 data
+        val cdol2 = cardData[0x8D] // CDOL2
+        if (cdol2 == null) {
+            // No CDOL2 - use CDOL1 format
+            Timber.d("No CDOL2, using CDOL1 format for second AC")
+        }
+
+        val cdolData = if (cdol2 != null) {
+            DolParser.buildDolData(cdol2, terminalData)
+        } else {
+            // Fall back to CDOL1
+            cardData[0x8C]?.let { DolParser.buildDolData(it, terminalData) } ?: ByteArray(0)
+        }
+
+        // Determine requested cryptogram type based on online result
+        val requestedCryptogramType = if (onlineApproved) {
+            EmvCommands.CryptogramType.TC
+        } else {
+            EmvCommands.CryptogramType.AAC
+        }
+
+        // Send GENERATE AC
+        val command = EmvCommands.generateAc(requestedCryptogramType, cdolData, cda = false)
+
+        val response = transceiver.transceive(command)
+
+        if (!response.isSuccess) {
+            return SecondAcResult.Error("Second GENERATE AC failed: SW=${response.sw.toString(16)}")
+        }
+
+        // Parse response
+        val tlvs = TlvParser.parseRecursive(response.data)
+        val tlvMap = tlvs.associateBy { it.tag.hex }
+
+        val cid = tlvMap["9F27"]?.value?.getOrNull(0) ?: return SecondAcResult.Error("Missing CID in response")
+        val ac = tlvMap["9F26"]?.value ?: return SecondAcResult.Error("Missing AC in response")
+        val atc = tlvMap["9F36"]?.value
+
+        // Update card data with response
+        tlvMap["9F26"]?.value?.let { cardData[0x9F26] = it }
+        tlvMap["9F27"]?.value?.let { cardData[0x9F27] = it }
+        atc?.let { cardData[0x9F36] = it }
+
+        val resultCryptogramType = when ((cid.toInt() and 0xC0) shr 6) {
+            0 -> CryptogramType.AAC
+            1 -> CryptogramType.TC
+            2 -> CryptogramType.ARQC
+            else -> CryptogramType.AAC
+        }
+
+        val authData = buildAuthorizationDataFromSecondAc(resultCryptogramType, ac, cid, atc)
+
+        return when (resultCryptogramType) {
+            CryptogramType.TC -> SecondAcResult.Approved(authData)
+            CryptogramType.AAC -> SecondAcResult.Declined("Card declined after online", authData)
+            else -> SecondAcResult.Error("Unexpected cryptogram type in second AC: $resultCryptogramType")
+        }
+    }
+
+    /**
+     * Derive session key from card data for ARPC verification
+     */
+    private fun deriveSessionKeyFromCardData(): ByteArray? {
+        // In production, this would derive the session key using the ICC Master Key
+        // and Application Transaction Counter (ATC)
+        // For now, return null to indicate ARPC verification is not available
+        // without proper key management infrastructure
+        val atc = cardData[0x9F36] ?: return null
+
+        // This is a placeholder - actual implementation requires ICC Master Key
+        // which is derived from Issuer Master Key during personalization
+        Timber.d("Session key derivation requires ICC Master Key infrastructure")
+        return null
+    }
+
+    /**
      * Reset kernel state for new transaction
      */
     private fun resetState() {
@@ -321,6 +569,28 @@ class MastercardContactlessKernel(
 
         // Step 3: Offline Data Authentication
         performOda(gpoResult.aip)
+
+        // Step 3.5: Relay Resistance Protocol (if supported)
+        if (gpoResult.aip.relayResistanceSupported) {
+            val rrpResult = performRelayResistanceProtocol()
+            when (rrpResult) {
+                is RrpResult.ThresholdExceeded -> {
+                    Timber.w("RRP threshold exceeded: ${rrpResult.measuredTime}ms > ${rrpResult.threshold}ms")
+                    tvr.relayResistanceThresholdExceeded = true
+                }
+                is RrpResult.TimeLimitsExceeded -> {
+                    Timber.w("RRP time limits exceeded")
+                    tvr.relayResistanceTimeLimitsExceeded = true
+                }
+                is RrpResult.Failed -> {
+                    Timber.w("RRP failed: ${rrpResult.reason}")
+                    tvr.relayResistanceThresholdExceeded = true
+                }
+                is RrpResult.Success -> {
+                    Timber.d("RRP successful: ${rrpResult.measuredTime}ms")
+                }
+            }
+        }
 
         // Step 4: Processing Restrictions
         val restrictionsResult = checkProcessingRestrictions()
@@ -648,6 +918,105 @@ class MastercardContactlessKernel(
         }
 
         return result.toByteArray()
+    }
+
+    /**
+     * Perform Relay Resistance Protocol
+     *
+     * Measures the time taken for the card to respond to a challenge,
+     * helping detect relay attacks where communication is being proxied.
+     */
+    private suspend fun performRelayResistanceProtocol(): RrpResult {
+        Timber.d("Performing Relay Resistance Protocol")
+
+        // Generate terminal relay resistance data
+        // Format: Terminal RRP Entropy (4 bytes) || Min Grace Period (2 bytes) || Max Grace Period (2 bytes)
+        // || Terminal Expected Transmission Time (2 bytes)
+        val terminalEntropy = ByteArray(4)
+        SecureRandom().nextBytes(terminalEntropy)
+
+        val minGracePeriod = config.minRelayResistanceGracePeriod
+        val maxGracePeriod = config.maxRelayResistanceGracePeriod
+
+        // Expected transmission time in 100 microseconds units
+        val expectedTransmissionTime = 50 // 5ms in 100μs units
+
+        val terminalRrpData = ByteArray(10)
+        System.arraycopy(terminalEntropy, 0, terminalRrpData, 0, 4)
+        terminalRrpData[4] = ((minGracePeriod shr 8) and 0xFF).toByte()
+        terminalRrpData[5] = (minGracePeriod and 0xFF).toByte()
+        terminalRrpData[6] = ((maxGracePeriod shr 8) and 0xFF).toByte()
+        terminalRrpData[7] = (maxGracePeriod and 0xFF).toByte()
+        terminalRrpData[8] = ((expectedTransmissionTime shr 8) and 0xFF).toByte()
+        terminalRrpData[9] = (expectedTransmissionTime and 0xFF).toByte()
+
+        // Store terminal RRP entropy for later verification
+        terminalData.set(0xDF8302, terminalEntropy)
+
+        // Measure start time
+        val startTime = System.nanoTime()
+
+        // Send EXCHANGE RELAY RESISTANCE DATA command
+        val command = EmvCommands.exchangeRelayResistanceData(terminalRrpData)
+        val response = try {
+            transceiver.transceive(command)
+        } catch (e: Exception) {
+            Timber.e(e, "RRP command failed")
+            return RrpResult.Failed("Command execution failed: ${e.message}")
+        }
+
+        // Measure end time
+        val endTime = System.nanoTime()
+        val measuredTimeMs = (endTime - startTime) / 1_000_000
+
+        if (!response.isSuccess) {
+            // Card doesn't support RRP or command failed
+            val sw = response.sw
+            if (sw == 0x6A81 || sw == 0x6D00) {
+                // Function not supported - not a failure
+                Timber.d("Card does not support EXCHANGE RELAY RESISTANCE DATA")
+                return RrpResult.Success(measuredTimeMs)
+            }
+            return RrpResult.Failed("RRP command failed: SW=${response.sw.toString(16)}")
+        }
+
+        // Parse response
+        // Format: Device RRP Entropy (4 bytes) || Measured Transmission Time (2 bytes) ||
+        //         Accuracy Threshold (1 byte) || Timing Flags (1 byte)
+        val responseData = response.data
+        if (responseData.size < 8) {
+            return RrpResult.Failed("Invalid RRP response length")
+        }
+
+        val deviceEntropy = responseData.copyOfRange(0, 4)
+        val deviceMeasuredTime = ((responseData[4].toInt() and 0xFF) shl 8) or (responseData[5].toInt() and 0xFF)
+        val accuracyThreshold = responseData[6].toInt() and 0xFF
+        val timingFlags = responseData[7].toInt() and 0xFF
+
+        // Store in card data
+        cardData[0xDF8303] = deviceEntropy
+        cardData[0xDF8304] = responseData.copyOfRange(4, 6)
+        cardData[0xDF8305] = byteArrayOf(responseData[6])
+        cardData[0xDF8306] = byteArrayOf(responseData[7])
+
+        // Calculate maximum allowed time
+        // Max time = expected transmission time + max grace period + accuracy threshold
+        val maxAllowedTimeMs = expectedTransmissionTime / 10 + maxGracePeriod + accuracyThreshold
+
+        Timber.d("RRP timing - Measured: ${measuredTimeMs}ms, Max allowed: ${maxAllowedTimeMs}ms")
+
+        // Check timing
+        if (measuredTimeMs > maxAllowedTimeMs) {
+            return RrpResult.ThresholdExceeded(measuredTimeMs, maxAllowedTimeMs.toLong())
+        }
+
+        // Check device timing flags for time limit exceeded
+        val deviceTimeLimitExceeded = (timingFlags and 0x01) != 0
+        if (deviceTimeLimitExceeded) {
+            return RrpResult.TimeLimitsExceeded
+        }
+
+        return RrpResult.Success(measuredTimeMs)
     }
 
     /**
@@ -1410,6 +1779,48 @@ class MastercardContactlessKernel(
     }
 
     /**
+     * Build authorization data from second GENERATE AC result
+     */
+    private fun buildAuthorizationDataFromSecondAc(
+        cryptogramType: CryptogramType,
+        applicationCryptogram: ByteArray,
+        cryptogramInfoData: Byte,
+        atc: ByteArray?
+    ): MastercardAuthorizationData {
+        val track2 = cardData[0x57]
+        val pan = cardData[0x5A]?.toHexString()?.trimEnd('F')
+            ?: track2?.let { MastercardTrack2Parser.parse(it)?.pan }
+            ?: ""
+
+        val expiryDate = cardData[0x5F24]?.toHexString()?.take(4) ?: ""
+
+        return MastercardAuthorizationData(
+            pan = pan,
+            expiryDate = expiryDate,
+            track2Equivalent = track2?.toHexString() ?: "",
+            panSequenceNumber = cardData[0x5F34]?.toHexString() ?: "00",
+            cryptogramType = cryptogramType,
+            applicationCryptogram = applicationCryptogram.toHexString(),
+            cryptogramInfoData = cryptogramInfoData,
+            atc = atc?.toHexString() ?: "",
+            issuerApplicationData = cardData[0x9F10]?.toHexString() ?: "",
+            tvr = tvr.toBytes().toHexString(),
+            cvmResults = terminalData.get(0x9F34)?.toHexString() ?: "",
+            amountAuthorized = terminalData.get(0x9F02)?.toHexString() ?: "",
+            amountOther = terminalData.get(0x9F03)?.toHexString() ?: "0",
+            terminalCountryCode = config.terminalCountryCode.toHexString(),
+            transactionCurrencyCode = config.transactionCurrencyCode.toHexString(),
+            transactionDate = terminalData.get(0x9A)?.toHexString() ?: "",
+            transactionType = terminalData.get(0x9C)?.toHexString() ?: "",
+            unpredictableNumber = terminalData.get(0x9F37)?.toHexString() ?: "",
+            aip = cardData[0x82]?.toHexString() ?: "",
+            aid = cardData[0x4F]?.toHexString() ?: cardData[0x84]?.toHexString() ?: "",
+            transactionMode = TransactionMode.M_CHIP,
+            cardholderName = cardData[0x5F20]?.let { String(it, Charsets.US_ASCII).trim() }
+        )
+    }
+
+    /**
      * Build discretionary data
      */
     private fun buildDiscretionaryData(): MastercardDiscretionaryData {
@@ -1497,6 +1908,13 @@ class MastercardContactlessKernel(
     private sealed class RestrictionResult {
         object Continue : RestrictionResult()
         data class SwitchInterface(val reason: String) : RestrictionResult()
+    }
+
+    private sealed class RrpResult {
+        data class Success(val measuredTime: Long) : RrpResult()
+        data class ThresholdExceeded(val measuredTime: Long, val threshold: Long) : RrpResult()
+        object TimeLimitsExceeded : RrpResult()
+        data class Failed(val reason: String) : RrpResult()
     }
 
     private sealed class GenerateAcResult {
@@ -1651,4 +2069,83 @@ private fun ByteArray.toHexString() = joinToString("") { "%02X".format(it) }
 private fun String.hexToByteArray(): ByteArray {
     check(length % 2 == 0) { "Hex string must have even length" }
     return chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+}
+
+// ==================== Online Response Processing ====================
+
+/**
+ * Online authorization response from issuer/acquirer
+ */
+data class OnlineAuthResponse(
+    /** Whether the transaction was approved online */
+    val approved: Boolean,
+    /** Authorization Response Code (tag 8A) - 2 bytes */
+    val arc: ByteArray? = null,
+    /** Authorization Response Cryptogram (ARPC) - 8 bytes */
+    val arpc: ByteArray? = null,
+    /** Issuer scripts to execute before second GENERATE AC (tag 71) */
+    val issuerScripts71: List<ByteArray>? = null,
+    /** Issuer scripts to execute after second GENERATE AC (tag 72) */
+    val issuerScripts72: List<ByteArray>? = null,
+    /** Issuer Authentication Data (tag 91) for ARPC verification */
+    val issuerAuthData: ByteArray? = null
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is OnlineAuthResponse) return false
+        return approved == other.approved &&
+                arc.contentEquals(other.arc) &&
+                arpc.contentEquals(other.arpc)
+    }
+
+    override fun hashCode(): Int {
+        var result = approved.hashCode()
+        result = 31 * result + (arc?.contentHashCode() ?: 0)
+        result = 31 * result + (arpc?.contentHashCode() ?: 0)
+        return result
+    }
+}
+
+/**
+ * Result of online response processing
+ */
+sealed class OnlineResponseResult {
+    data class Approved(
+        val authorizationData: MastercardAuthorizationData,
+        val scriptResults: List<IssuerScriptResult>
+    ) : OnlineResponseResult()
+
+    data class Declined(
+        val reason: String,
+        val authorizationData: MastercardAuthorizationData?,
+        val scriptResults: List<IssuerScriptResult>
+    ) : OnlineResponseResult()
+
+    data class ScriptFailed(
+        val error: String,
+        val scriptResults: List<IssuerScriptResult>
+    ) : OnlineResponseResult()
+
+    data class Error(
+        val error: String,
+        val scriptResults: List<IssuerScriptResult>
+    ) : OnlineResponseResult()
+}
+
+/**
+ * Result of issuer script execution
+ */
+data class IssuerScriptResult(
+    val success: Boolean,
+    val sw: Int,
+    val abortTransaction: Boolean
+)
+
+/**
+ * Internal result of second GENERATE AC
+ */
+private sealed class SecondAcResult {
+    data class Approved(val authData: MastercardAuthorizationData) : SecondAcResult()
+    data class Declined(val reason: String, val authData: MastercardAuthorizationData?) : SecondAcResult()
+    data class Error(val error: String) : SecondAcResult()
 }

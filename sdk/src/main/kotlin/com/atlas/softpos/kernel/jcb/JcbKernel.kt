@@ -317,6 +317,232 @@ class JcbKernel(
         tvr[byteIndex] = (tvr[byteIndex].toInt() or bitMask).toByte()
         transactionData[EmvTags.TERMINAL_VERIFICATION_RESULTS.hex] = tvr
     }
+
+    // ==================== ONLINE RESPONSE PROCESSING ====================
+
+    /**
+     * Process online authorization response from issuer
+     */
+    suspend fun processOnlineResponse(
+        onlineResponse: JcbOnlineAuthResponse,
+        previousRequest: JcbAuthorizationRequest
+    ): JcbOnlineResponseResult {
+        try {
+            // Step 1: Verify ARPC if provided
+            if (onlineResponse.arpc != null && onlineResponse.arc != null) {
+                val arpcValid = verifyArpc(
+                    arqc = previousRequest.applicationCryptogram.hexToByteArray(),
+                    arpc = onlineResponse.arpc,
+                    arc = onlineResponse.arc
+                )
+
+                if (!arpcValid) {
+                    setTvrBit(4, 0x40) // Issuer authentication failed
+                }
+            }
+
+            // Step 2: Execute issuer scripts before 2nd GENERATE AC (tag 71)
+            val script71Results = mutableListOf<JcbIssuerScriptResult>()
+            onlineResponse.issuerScripts71?.let { scripts ->
+                for (script in scripts) {
+                    val result = executeIssuerScript(script, true)
+                    script71Results.add(result)
+                    if (!result.success && result.abortTransaction) {
+                        return JcbOnlineResponseResult.ScriptFailed(
+                            scriptResults = script71Results,
+                            failedScriptTag = "71"
+                        )
+                    }
+                }
+            }
+
+            // Step 3: Perform second GENERATE AC
+            val secondAcResult = performSecondGenerateAc(onlineResponse.approved)
+
+            // Step 4: Execute issuer scripts after 2nd GENERATE AC (tag 72)
+            val script72Results = mutableListOf<JcbIssuerScriptResult>()
+            onlineResponse.issuerScripts72?.let { scripts ->
+                for (script in scripts) {
+                    val result = executeIssuerScript(script, false)
+                    script72Results.add(result)
+                }
+            }
+
+            val allScriptResults = script71Results + script72Results
+
+            return when (secondAcResult) {
+                is JcbSecondAcResult.Approved -> JcbOnlineResponseResult.Approved(
+                    cryptogram = secondAcResult.cryptogram,
+                    scriptResults = allScriptResults
+                )
+                is JcbSecondAcResult.Declined -> JcbOnlineResponseResult.Declined(
+                    cryptogram = secondAcResult.cryptogram,
+                    reason = secondAcResult.reason,
+                    scriptResults = allScriptResults
+                )
+                is JcbSecondAcResult.Error -> JcbOnlineResponseResult.Error(
+                    reason = secondAcResult.message,
+                    scriptResults = allScriptResults
+                )
+            }
+
+        } catch (e: Exception) {
+            return JcbOnlineResponseResult.Error(
+                reason = "Processing error: ${e.message}",
+                scriptResults = emptyList()
+            )
+        }
+    }
+
+    private fun verifyArpc(arqc: ByteArray, arpc: ByteArray, arc: ByteArray): Boolean {
+        val sessionKey = deriveSessionKeyFromCardData() ?: return false
+
+        val arcPadded = ByteArray(8)
+        System.arraycopy(arc, 0, arcPadded, 0, minOf(arc.size, 2))
+
+        val xorResult = ByteArray(8)
+        for (i in 0 until 8) {
+            xorResult[i] = (arqc.getOrElse(i) { 0 }.toInt() xor arcPadded[i].toInt()).toByte()
+        }
+
+        return try {
+            val cipher = javax.crypto.Cipher.getInstance("DESede/ECB/NoPadding")
+            val expandedKey = if (sessionKey.size == 16) {
+                sessionKey + sessionKey.copyOfRange(0, 8)
+            } else {
+                sessionKey
+            }
+            val keySpec = javax.crypto.spec.SecretKeySpec(expandedKey, "DESede")
+            cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, keySpec)
+            val computedArpc = cipher.doFinal(xorResult)
+
+            computedArpc.copyOfRange(0, arpc.size).contentEquals(arpc)
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private suspend fun executeIssuerScript(script: ByteArray, isPreAc: Boolean): JcbIssuerScriptResult {
+        try {
+            val commands = parseIssuerScriptCommands(script)
+            if (commands.isEmpty()) {
+                return JcbIssuerScriptResult(success = true, sw = 0x9000, abortTransaction = false)
+            }
+
+            var lastSw = 0x9000
+            for (commandData in commands) {
+                if (commandData.size < 4) continue
+
+                val command = com.atlas.softpos.core.apdu.CommandApdu(
+                    cla = commandData[0],
+                    ins = commandData[1],
+                    p1 = commandData[2],
+                    p2 = commandData[3],
+                    data = if (commandData.size > 5) {
+                        val lc = commandData[4].toInt() and 0xFF
+                        commandData.copyOfRange(5, minOf(5 + lc, commandData.size))
+                    } else null,
+                    le = null
+                )
+
+                val response = transceiver.transceive(command)
+                lastSw = response.sw
+
+                if (!response.isSuccess) {
+                    if (isPreAc) {
+                        setTvrBit(4, 0x20) // Script failed before 2nd AC
+                    } else {
+                        setTvrBit(4, 0x10) // Script failed after 2nd AC
+                    }
+
+                    return JcbIssuerScriptResult(
+                        success = false,
+                        sw = lastSw,
+                        abortTransaction = isPreAc && lastSw == 0x6985
+                    )
+                }
+            }
+
+            return JcbIssuerScriptResult(success = true, sw = lastSw, abortTransaction = false)
+
+        } catch (e: Exception) {
+            if (isPreAc) setTvrBit(4, 0x20) else setTvrBit(4, 0x10)
+            return JcbIssuerScriptResult(success = false, sw = 0x6F00, abortTransaction = false)
+        }
+    }
+
+    private fun parseIssuerScriptCommands(script: ByteArray): List<ByteArray> {
+        val commands = mutableListOf<ByteArray>()
+        var offset = 0
+
+        while (offset < script.size) {
+            if (script[offset] != 0x86.toByte()) {
+                offset++
+                continue
+            }
+            offset++
+
+            if (offset >= script.size) break
+
+            var length = script[offset].toInt() and 0xFF
+            offset++
+
+            if (length == 0x81) {
+                if (offset >= script.size) break
+                length = script[offset].toInt() and 0xFF
+                offset++
+            }
+
+            if (offset + length > script.size) break
+
+            commands.add(script.copyOfRange(offset, offset + length))
+            offset += length
+        }
+
+        return commands
+    }
+
+    private suspend fun performSecondGenerateAc(approved: Boolean): JcbSecondAcResult {
+        val cdol2 = cardData[EmvTags.CDOL2.hex] ?: cardData[EmvTags.CDOL1.hex]
+        val cdolData = buildCdolData(cdol2)
+
+        val acType = if (approved) EmvCommands.CryptogramType.TC else EmvCommands.CryptogramType.AAC
+        val command = EmvCommands.generateAc(acType, cdolData, cda = false)
+        val response = transceiver.transceive(command)
+
+        if (!response.isSuccess) {
+            return JcbSecondAcResult.Error("Second GENERATE AC failed")
+        }
+
+        val tlvs = TlvParser.parseRecursive(response.data)
+        val cidTlv = tlvs.find { it.tag.hex == EmvTags.CRYPTOGRAM_INFO_DATA.hex }
+        val cid = cidTlv?.value?.firstOrNull()?.toInt()?.and(0xFF) ?: 0x00
+        val cryptogramType = (cid and 0xC0) shr 6
+
+        val cryptogram = tlvs.find { it.tag.hex == EmvTags.APPLICATION_CRYPTOGRAM.hex }?.value
+
+        return when (cryptogramType) {
+            1 -> JcbSecondAcResult.Approved(cryptogram)
+            0 -> JcbSecondAcResult.Declined(cryptogram, "Card declined after online auth")
+            else -> JcbSecondAcResult.Declined(cryptogram, "Unexpected response")
+        }
+    }
+
+    private fun deriveSessionKeyFromCardData(): ByteArray? {
+        val atc = cardData[EmvTags.APPLICATION_TRANSACTION_COUNTER.hex]
+        val pan = cardData[EmvTags.PAN.hex]
+        val psn = cardData[EmvTags.PAN_SEQUENCE_NUMBER.hex]
+
+        if (atc == null || pan == null) return null
+
+        val keyMaterial = ByteArray(16)
+        val panBytes = pan.copyOfRange(0, minOf(8, pan.size))
+        System.arraycopy(panBytes, 0, keyMaterial, 0, panBytes.size)
+        System.arraycopy(atc, 0, keyMaterial, 8, minOf(2, atc.size))
+        psn?.let { System.arraycopy(it, 0, keyMaterial, 10, minOf(1, it.size)) }
+
+        return keyMaterial
+    }
 }
 
 // Configuration and Data Classes
@@ -404,3 +630,64 @@ data class JcbAuthorizationRequest(
     val cardholderName: String,
     val rawCryptogramData: String
 )
+
+// ==================== ONLINE RESPONSE DATA CLASSES ====================
+
+data class JcbOnlineAuthResponse(
+    val approved: Boolean,
+    val arc: ByteArray? = null,
+    val arpc: ByteArray? = null,
+    val issuerScripts71: List<ByteArray>? = null,
+    val issuerScripts72: List<ByteArray>? = null,
+    val issuerAuthData: ByteArray? = null
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is JcbOnlineAuthResponse) return false
+        return approved == other.approved &&
+                arc.contentEquals(other.arc) &&
+                arpc.contentEquals(other.arpc)
+    }
+
+    override fun hashCode(): Int {
+        var result = approved.hashCode()
+        result = 31 * result + (arc?.contentHashCode() ?: 0)
+        result = 31 * result + (arpc?.contentHashCode() ?: 0)
+        return result
+    }
+}
+
+sealed class JcbOnlineResponseResult {
+    data class Approved(
+        val cryptogram: ByteArray?,
+        val scriptResults: List<JcbIssuerScriptResult>
+    ) : JcbOnlineResponseResult()
+
+    data class Declined(
+        val cryptogram: ByteArray?,
+        val reason: String,
+        val scriptResults: List<JcbIssuerScriptResult>
+    ) : JcbOnlineResponseResult()
+
+    data class ScriptFailed(
+        val scriptResults: List<JcbIssuerScriptResult>,
+        val failedScriptTag: String
+    ) : JcbOnlineResponseResult()
+
+    data class Error(
+        val reason: String,
+        val scriptResults: List<JcbIssuerScriptResult>
+    ) : JcbOnlineResponseResult()
+}
+
+data class JcbIssuerScriptResult(
+    val success: Boolean,
+    val sw: Int,
+    val abortTransaction: Boolean
+)
+
+sealed class JcbSecondAcResult {
+    data class Approved(val cryptogram: ByteArray?) : JcbSecondAcResult()
+    data class Declined(val cryptogram: ByteArray?, val reason: String) : JcbSecondAcResult()
+    data class Error(val message: String) : JcbSecondAcResult()
+}

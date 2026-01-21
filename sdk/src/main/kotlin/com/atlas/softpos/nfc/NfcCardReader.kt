@@ -140,7 +140,7 @@ class NfcCardReader(private val activity: Activity) {
         currentIsoDep = isoDep
 
         Timber.d("Connected to card. Max transceive length: ${isoDep.maxTransceiveLength}")
-        Timber.d("Historical bytes: ${isoDep.historicalBytes?.toHexString() ?: "none"}")
+        Timber.d("Historical bytes present: ${isoDep.historicalBytes?.isNotEmpty() ?: false}")
 
         NfcTransceiver(isoDep)
     }
@@ -178,12 +178,20 @@ class NfcTransceiver(private val isoDep: IsoDep) : CardTransceiver {
         withContext(Dispatchers.IO) {
             try {
                 val commandBytes = command.encode()
-                Timber.d(">>> ${commandBytes.toHexString()}")
+                // Log command type only (CLA/INS), not data which may contain sensitive info
+                Timber.d(">>> APDU: CLA=%02X INS=%02X P1=%02X P2=%02X Lc=%d".format(
+                    command.cla.toInt() and 0xFF,
+                    command.ins.toInt() and 0xFF,
+                    command.p1.toInt() and 0xFF,
+                    command.p2.toInt() and 0xFF,
+                    command.data?.size ?: 0
+                ))
 
                 val responseBytes = isoDep.transceive(commandBytes)
-                Timber.d("<<< ${responseBytes.toHexString()}")
-
                 var response = ResponseApdu.fromBytes(responseBytes)
+
+                // Log response status only, not data
+                Timber.d("<<< SW=%04X Len=%d".format(response.sw, response.data.size))
 
                 // Handle GET RESPONSE for 61XX status
                 while (response.hasMoreData) {
@@ -195,11 +203,11 @@ class NfcTransceiver(private val isoDep: IsoDep) : CardTransceiver {
                         le = response.additionalDataLength
                     )
 
-                    Timber.d(">>> GET RESPONSE: ${getResponseCmd.encode().toHexString()}")
+                    Timber.d(">>> GET RESPONSE Le=%d".format(response.additionalDataLength))
                     val additionalData = isoDep.transceive(getResponseCmd.encode())
-                    Timber.d("<<< ${additionalData.toHexString()}")
-
                     val additionalResponse = ResponseApdu.fromBytes(additionalData)
+                    Timber.d("<<< SW=%04X Len=%d".format(additionalResponse.sw, additionalResponse.data.size))
+
                     response = ResponseApdu(
                         data = response.data + additionalResponse.data,
                         sw1 = additionalResponse.sw1,

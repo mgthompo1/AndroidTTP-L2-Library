@@ -68,7 +68,7 @@ class DukptKeyManager(
         initializeFutureKeys(ipek)
 
         initialized = true
-        Timber.d("DUKPT initialized with KSN: ${initialKsn.toHexString()}")
+        Timber.d("DUKPT initialized")
     }
 
     /**
@@ -103,7 +103,7 @@ class DukptKeyManager(
         transactionCounter++
         updateFutureKeys()
 
-        Timber.d("DUKPT key derived, counter=$transactionCounter, KSN=${currentKsn.toHexString()}")
+        Timber.d("DUKPT key derived, remaining=${MAX_TRANSACTION_COUNT - transactionCounter}")
 
         return DukptKeyResult(
             pinEncryptionKey = pinKey,

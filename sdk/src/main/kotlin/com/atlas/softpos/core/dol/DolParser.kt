@@ -84,7 +84,7 @@ object DolParser {
             val data = formatValue(value, entry.length, entry.tagValue)
             result.addAll(data.toList())
 
-            Timber.v("DOL entry ${entry.tagHex}: requested=${entry.length}, provided=${data.size}, value=${data.toHexString()}")
+            Timber.v("DOL entry ${entry.tagHex}: requested=${entry.length}, provided=${data.size}")
         }
 
         return result.toByteArray()

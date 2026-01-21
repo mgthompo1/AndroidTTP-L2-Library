@@ -848,6 +848,305 @@ class AmexContactlessKernel(
         }
     }
 
+    // ==================== ONLINE RESPONSE PROCESSING ====================
+
+    /**
+     * Process online authorization response from issuer
+     *
+     * @param onlineResponse Response from issuer/acquirer
+     * @param previousAuthData Authorization data from initial GENERATE AC
+     * @return Result of online processing
+     */
+    suspend fun processOnlineResponse(
+        onlineResponse: AmexOnlineAuthResponse,
+        previousAuthData: AmexAuthorizationData
+    ): AmexOnlineResponseResult {
+        Timber.d("=== AMEX ONLINE RESPONSE PROCESSING ===")
+        Timber.d("Online approved: ${onlineResponse.approved}")
+
+        try {
+            // Step 1: Verify ARPC if provided
+            if (onlineResponse.arpc != null && onlineResponse.arc != null) {
+                val arpcValid = verifyArpc(
+                    arqc = previousAuthData.applicationCryptogram.hexToByteArray(),
+                    arpc = onlineResponse.arpc,
+                    arc = onlineResponse.arc
+                )
+
+                if (!arpcValid) {
+                    tvr.issuerAuthFailed = true
+                    Timber.w("ARPC verification failed")
+                }
+            }
+
+            // Step 2: Execute issuer scripts before 2nd GENERATE AC (tag 71)
+            val script71Results = mutableListOf<AmexIssuerScriptResult>()
+            onlineResponse.issuerScripts71?.let { scripts ->
+                Timber.d("Processing ${scripts.size} tag 71 issuer scripts")
+                for (script in scripts) {
+                    val result = executeIssuerScript(script, true)
+                    script71Results.add(result)
+                    if (!result.success && result.abortTransaction) {
+                        return AmexOnlineResponseResult.ScriptFailed(
+                            scriptResults = script71Results,
+                            failedScriptTag = "71",
+                            tvr = tvr.toBytes().toHexString()
+                        )
+                    }
+                }
+            }
+
+            // Step 3: Perform second GENERATE AC
+            val secondAcResult = performSecondGenerateAc(onlineResponse.approved)
+
+            // Step 4: Execute issuer scripts after 2nd GENERATE AC (tag 72)
+            val script72Results = mutableListOf<AmexIssuerScriptResult>()
+            onlineResponse.issuerScripts72?.let { scripts ->
+                Timber.d("Processing ${scripts.size} tag 72 issuer scripts")
+                for (script in scripts) {
+                    val result = executeIssuerScript(script, false)
+                    script72Results.add(result)
+                }
+            }
+
+            val allScriptResults = script71Results + script72Results
+
+            return when (secondAcResult) {
+                is AmexSecondAcResult.Approved -> AmexOnlineResponseResult.Approved(
+                    cryptogram = secondAcResult.cryptogram,
+                    cryptogramType = "TC",
+                    scriptResults = allScriptResults,
+                    tvr = tvr.toBytes().toHexString()
+                )
+                is AmexSecondAcResult.Declined -> AmexOnlineResponseResult.Declined(
+                    cryptogram = secondAcResult.cryptogram,
+                    reason = secondAcResult.reason,
+                    scriptResults = allScriptResults,
+                    tvr = tvr.toBytes().toHexString()
+                )
+                is AmexSecondAcResult.Error -> AmexOnlineResponseResult.Error(
+                    reason = secondAcResult.message,
+                    scriptResults = allScriptResults,
+                    tvr = tvr.toBytes().toHexString()
+                )
+            }
+
+        } catch (e: Exception) {
+            Timber.e(e, "Online response processing failed")
+            return AmexOnlineResponseResult.Error(
+                reason = "Processing error: ${e.message}",
+                scriptResults = emptyList(),
+                tvr = tvr.toBytes().toHexString()
+            )
+        }
+    }
+
+    /**
+     * Verify ARPC (Authorization Response Cryptogram)
+     */
+    private fun verifyArpc(arqc: ByteArray, arpc: ByteArray, arc: ByteArray): Boolean {
+        Timber.d("Verifying ARPC")
+
+        val sessionKey = deriveSessionKeyFromCardData() ?: run {
+            Timber.w("Could not derive session key for ARPC verification")
+            return false
+        }
+
+        // ARPC Method 1: ARPC = 3DES_ENC(SK, ARQC XOR (ARC || 0x00000000))
+        val arcPadded = ByteArray(8)
+        System.arraycopy(arc, 0, arcPadded, 0, minOf(arc.size, 2))
+
+        val xorResult = ByteArray(8)
+        for (i in 0 until 8) {
+            xorResult[i] = (arqc.getOrElse(i) { 0 }.toInt() xor arcPadded[i].toInt()).toByte()
+        }
+
+        return try {
+            val cipher = javax.crypto.Cipher.getInstance("DESede/ECB/NoPadding")
+            val expandedKey = if (sessionKey.size == 16) {
+                sessionKey + sessionKey.copyOfRange(0, 8)
+            } else {
+                sessionKey
+            }
+            val keySpec = javax.crypto.spec.SecretKeySpec(expandedKey, "DESede")
+            cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, keySpec)
+            val computedArpc = cipher.doFinal(xorResult)
+
+            val matches = computedArpc.copyOfRange(0, arpc.size).contentEquals(arpc)
+            Timber.d("ARPC verification: ${if (matches) "PASSED" else "FAILED"}")
+            matches
+        } catch (e: Exception) {
+            Timber.e(e, "ARPC calculation error")
+            false
+        }
+    }
+
+    /**
+     * Execute an issuer script command
+     */
+    private suspend fun executeIssuerScript(script: ByteArray, isPreAc: Boolean): AmexIssuerScriptResult {
+        Timber.d("Executing issuer script (${script.size} bytes)")
+
+        try {
+            val commands = parseIssuerScriptCommands(script)
+            if (commands.isEmpty()) {
+                return AmexIssuerScriptResult(success = true, sw = 0x9000, abortTransaction = false)
+            }
+
+            var lastSw = 0x9000
+            for (commandData in commands) {
+                if (commandData.size < 4) continue
+
+                val command = CommandApdu(
+                    cla = commandData[0],
+                    ins = commandData[1],
+                    p1 = commandData[2],
+                    p2 = commandData[3],
+                    data = if (commandData.size > 5) {
+                        val lc = commandData[4].toInt() and 0xFF
+                        commandData.copyOfRange(5, minOf(5 + lc, commandData.size))
+                    } else null,
+                    le = null
+                )
+
+                val response = transceiver.transceive(command)
+                lastSw = response.sw
+
+                if (!response.isSuccess) {
+                    Timber.w("Script command failed: SW=%04X", lastSw)
+
+                    if (isPreAc) {
+                        tvr.scriptFailedBeforeAc = true
+                    } else {
+                        tvr.scriptFailedAfterAc = true
+                    }
+
+                    return AmexIssuerScriptResult(
+                        success = false,
+                        sw = lastSw,
+                        abortTransaction = isPreAc && lastSw == 0x6985
+                    )
+                }
+            }
+
+            return AmexIssuerScriptResult(success = true, sw = lastSw, abortTransaction = false)
+
+        } catch (e: Exception) {
+            Timber.e(e, "Error executing issuer script")
+            if (isPreAc) {
+                tvr.scriptFailedBeforeAc = true
+            } else {
+                tvr.scriptFailedAfterAc = true
+            }
+            return AmexIssuerScriptResult(success = false, sw = 0x6F00, abortTransaction = false)
+        }
+    }
+
+    /**
+     * Parse issuer script commands from tag 71/72 data
+     */
+    private fun parseIssuerScriptCommands(script: ByteArray): List<ByteArray> {
+        val commands = mutableListOf<ByteArray>()
+        var offset = 0
+
+        while (offset < script.size) {
+            if (script[offset] != 0x86.toByte()) {
+                offset++
+                continue
+            }
+            offset++
+
+            if (offset >= script.size) break
+
+            var length = script[offset].toInt() and 0xFF
+            offset++
+
+            if (length == 0x81) {
+                if (offset >= script.size) break
+                length = script[offset].toInt() and 0xFF
+                offset++
+            }
+
+            if (offset + length > script.size) break
+
+            commands.add(script.copyOfRange(offset, offset + length))
+            offset += length
+        }
+
+        return commands
+    }
+
+    /**
+     * Perform second GENERATE AC
+     */
+    private suspend fun performSecondGenerateAc(approved: Boolean): AmexSecondAcResult {
+        Timber.d("Performing second GENERATE AC, approved=$approved")
+
+        val cdol2 = cardData[AmexTags.CDOL2]?.value ?: cardData[AmexTags.CDOL1]?.value
+        if (cdol2 == null) {
+            return AmexSecondAcResult.Error("Missing CDOL2/CDOL1 for second AC")
+        }
+
+        dataStore.set(0x95, tvr.toBytes())
+        val cdolData = DolParser.buildDolData(cdol2, dataStore)
+
+        val p1 = if (approved) 0x40.toByte() else 0x00.toByte()
+
+        val command = CommandApdu(
+            cla = 0x80.toByte(),
+            ins = 0xAE.toByte(),
+            p1 = p1,
+            p2 = 0x00,
+            data = cdolData,
+            le = 0x00
+        )
+
+        val response = transceiver.transceive(command)
+
+        if (!response.isSuccess) {
+            return AmexSecondAcResult.Error("Second GENERATE AC failed: ${response.sw.toString(16)}")
+        }
+
+        val acResponse = parseGenerateAcResponse(response.data)
+        if (acResponse == null) {
+            return AmexSecondAcResult.Error("Failed to parse second AC response")
+        }
+
+        val cryptogramHex = acResponse.cryptogram.toHexString()
+
+        return when (acResponse.cryptogramType) {
+            CryptogramType.TC -> AmexSecondAcResult.Approved(cryptogramHex)
+            CryptogramType.AAC -> AmexSecondAcResult.Declined(cryptogramHex, "Card declined after online auth")
+            else -> AmexSecondAcResult.Declined(cryptogramHex, "Unexpected response")
+        }
+    }
+
+    /**
+     * Derive session key from card data
+     */
+    private fun deriveSessionKeyFromCardData(): ByteArray? {
+        val atc = cardData[AmexTags.ATC]?.value
+        val pan = cardData[AmexTags.PAN]?.value
+        val psn = cardData["5F34"]?.value
+
+        if (atc == null || pan == null) return null
+
+        Timber.w("Using simplified session key derivation - production should use proper key management")
+
+        val keyMaterial = ByteArray(16)
+        val panBytes = pan.copyOfRange(0, minOf(8, pan.size))
+        System.arraycopy(panBytes, 0, keyMaterial, 0, panBytes.size)
+        System.arraycopy(atc, 0, keyMaterial, 8, minOf(2, atc.size))
+        psn?.let { System.arraycopy(it, 0, keyMaterial, 10, minOf(1, it.size)) }
+
+        return keyMaterial
+    }
+
+    private fun String.hexToByteArray(): ByteArray {
+        require(length % 2 == 0) { "Hex string must have even length" }
+        return chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+    }
+
     private fun amountToBytes(amount: Long): ByteArray {
         val hex = "%012d".format(amount)
         return hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
@@ -960,3 +1259,81 @@ data class AmexTransactionData(
     val cashbackAmount: Long? = null,
     val transactionType: Byte = 0x00
 )
+
+// ==================== ONLINE RESPONSE DATA CLASSES ====================
+
+/**
+ * Online authorization response from issuer
+ */
+data class AmexOnlineAuthResponse(
+    val approved: Boolean,
+    val arc: ByteArray? = null,
+    val arpc: ByteArray? = null,
+    val issuerScripts71: List<ByteArray>? = null,
+    val issuerScripts72: List<ByteArray>? = null,
+    val issuerAuthData: ByteArray? = null
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is AmexOnlineAuthResponse) return false
+        return approved == other.approved &&
+                arc.contentEquals(other.arc) &&
+                arpc.contentEquals(other.arpc)
+    }
+
+    override fun hashCode(): Int {
+        var result = approved.hashCode()
+        result = 31 * result + (arc?.contentHashCode() ?: 0)
+        result = 31 * result + (arpc?.contentHashCode() ?: 0)
+        return result
+    }
+}
+
+/**
+ * Result of processing online authorization response
+ */
+sealed class AmexOnlineResponseResult {
+    data class Approved(
+        val cryptogram: String,
+        val cryptogramType: String,
+        val scriptResults: List<AmexIssuerScriptResult>,
+        val tvr: String
+    ) : AmexOnlineResponseResult()
+
+    data class Declined(
+        val cryptogram: String,
+        val reason: String,
+        val scriptResults: List<AmexIssuerScriptResult>,
+        val tvr: String
+    ) : AmexOnlineResponseResult()
+
+    data class ScriptFailed(
+        val scriptResults: List<AmexIssuerScriptResult>,
+        val failedScriptTag: String,
+        val tvr: String
+    ) : AmexOnlineResponseResult()
+
+    data class Error(
+        val reason: String,
+        val scriptResults: List<AmexIssuerScriptResult>,
+        val tvr: String
+    ) : AmexOnlineResponseResult()
+}
+
+/**
+ * Result of issuer script execution
+ */
+data class AmexIssuerScriptResult(
+    val success: Boolean,
+    val sw: Int,
+    val abortTransaction: Boolean
+)
+
+/**
+ * Result of second GENERATE AC
+ */
+sealed class AmexSecondAcResult {
+    data class Approved(val cryptogram: String) : AmexSecondAcResult()
+    data class Declined(val cryptogram: String, val reason: String) : AmexSecondAcResult()
+    data class Error(val message: String) : AmexSecondAcResult()
+}
