@@ -1,10 +1,11 @@
 package com.atlas.softpos.kernel.unionpay
 
+import com.atlas.softpos.core.apdu.CommandApdu
 import com.atlas.softpos.core.apdu.ResponseApdu
 import com.atlas.softpos.core.tlv.TlvParser
 import com.atlas.softpos.core.tlv.TlvBuilder
 import com.atlas.softpos.crypto.CaPublicKeyStore
-import com.atlas.softpos.nfc.CardTransceiver
+import com.atlas.softpos.kernel.common.CardTransceiver
 import java.security.SecureRandom
 
 /**
@@ -34,7 +35,6 @@ class UnionPayContactlessKernel(
     private val config: UnionPayKernelConfiguration
 ) {
     private val secureRandom = SecureRandom()
-    private val tlvParser = TlvParser()
 
     // Transaction data accumulated during processing
     private val transactionData = mutableMapOf<String, ByteArray>()
@@ -161,23 +161,27 @@ class UnionPayContactlessKernel(
     }
 
     private suspend fun selectApplication(aid: ByteArray): UnionPaySelectResult {
-        val selectCmd = byteArrayOf(
-            0x00, 0xA4.toByte(), 0x04, 0x00,
-            aid.size.toByte()
-        ) + aid + byteArrayOf(0x00)
+        val selectCmd = CommandApdu(
+            cla = 0x00,
+            ins = 0xA4.toByte(),
+            p1 = 0x04,
+            p2 = 0x00,
+            data = aid,
+            le = 0
+        )
 
-        val response = transceiver.transceive(selectCmd)
-        val apdu = ResponseApdu.parse(response)
+        val apdu = transceiver.transceive(selectCmd)
 
         if (!apdu.isSuccess) {
-            return UnionPaySelectResult.Failed(apdu.sw1, apdu.sw2)
+            return UnionPaySelectResult.Failed(apdu.sw1.toInt() and 0xFF, apdu.sw2.toInt() and 0xFF)
         }
 
         // Parse FCI
-        val fci = tlvParser.parse(apdu.data)
-        val pdol = fci["9F38"]
-        val appLabel = fci["50"]
-        val preferredName = fci["9F12"]
+        val fciTlvs = TlvParser.parseRecursive(apdu.data)
+        val fciMap = fciTlvs.associateBy { it.tag.hex }
+        val pdol = fciMap["9F38"]?.value
+        val appLabel = fciMap["50"]?.value
+        val preferredName = fciMap["9F12"]?.value
 
         // Store AID
         transactionData["4F"] = aid
@@ -201,18 +205,23 @@ class UnionPayContactlessKernel(
             byteArrayOf()
         }
 
-        // Build GPO command
-        val gpoData = TlvBuilder()
-            .add(0x83, pdolData)
-            .build()
+        // Build GPO command data (83 + length + PDOL data)
+        val gpoData = if (pdolData.isNotEmpty()) {
+            byteArrayOf(0x83.toByte(), pdolData.size.toByte()) + pdolData
+        } else {
+            byteArrayOf(0x83.toByte(), 0x00.toByte())
+        }
 
-        val gpoCmd = byteArrayOf(
-            0x80.toByte(), 0xA8.toByte(), 0x00, 0x00,
-            gpoData.size.toByte()
-        ) + gpoData + byteArrayOf(0x00)
+        val gpoCmd = CommandApdu(
+            cla = 0x80.toByte(),
+            ins = 0xA8.toByte(),
+            p1 = 0x00,
+            p2 = 0x00,
+            data = gpoData,
+            le = 0
+        )
 
-        val response = transceiver.transceive(gpoCmd)
-        val apdu = ResponseApdu.parse(response)
+        val apdu = transceiver.transceive(gpoCmd)
 
         // Check for conditions requiring different interface
         if (apdu.sw1.toInt() and 0xFF == 0x69 && apdu.sw2.toInt() and 0xFF == 0x84) {
@@ -220,7 +229,7 @@ class UnionPayContactlessKernel(
         }
 
         if (!apdu.isSuccess) {
-            return UnionPayGpoResult.Failed(apdu.sw1, apdu.sw2)
+            return UnionPayGpoResult.Failed(apdu.sw1.toInt() and 0xFF, apdu.sw2.toInt() and 0xFF)
         }
 
         return parseGpoResponse(apdu.data)
@@ -280,19 +289,20 @@ class UnionPayContactlessKernel(
                 )
             } else {
                 // Format 2
-                val tlv = tlvParser.parse(data)
+                val tlvList = TlvParser.parseRecursive(data)
+                val tlvMap = tlvList.associateBy({ it.tag.hex }, { it.value })
 
-                val aipBytes = tlv["82"] ?: return UnionPayGpoResult.Failed(0x6F, 0x00)
-                val aflBytes = tlv["94"] ?: byteArrayOf()
+                val aipBytes = tlvMap["82"] ?: return UnionPayGpoResult.Failed(0x6F, 0x00)
+                val aflBytes = tlvMap["94"] ?: byteArrayOf()
 
                 // Extract CTQ if present
-                tlv["9F6C"]?.let {
+                tlvMap["9F6C"]?.let {
                     ctq = UnionPayCardTransactionQualifiers(it)
                     transactionData["9F6C"] = it
                 }
 
                 // Store all response data
-                tlv.forEach { (tag, value) ->
+                tlvMap.forEach { (tag, value) ->
                     transactionData[tag] = value
                 }
 
@@ -301,7 +311,7 @@ class UnionPayContactlessKernel(
                 UnionPayGpoResult.Success(
                     aip = aip,
                     afl = aflBytes,
-                    responseData = tlv
+                    responseData = tlvMap
                 )
             }
         } catch (e: Exception) {
@@ -387,23 +397,23 @@ class UnionPayContactlessKernel(
             val odaRecords = afl[i + 3].toInt() and 0xFF
 
             for (record in firstRecord..lastRecord) {
-                val readCmd = byteArrayOf(
-                    0x00, 0xB2.toByte(),
-                    record.toByte(),
-                    ((sfi shl 3) or 0x04).toByte(),
-                    0x00
+                val readCmd = CommandApdu(
+                    cla = 0x00,
+                    ins = 0xB2.toByte(),
+                    p1 = record.toByte(),
+                    p2 = ((sfi shl 3) or 0x04).toByte(),
+                    le = 0
                 )
 
-                val response = transceiver.transceive(readCmd)
-                val apdu = ResponseApdu.parse(response)
+                val apdu = transceiver.transceive(readCmd)
 
                 if (!apdu.isSuccess) {
                     return false
                 }
 
-                val recordTlv = tlvParser.parse(apdu.data)
-                recordTlv.forEach { (tag, value) ->
-                    transactionData[tag] = value
+                val recordTlvList = TlvParser.parseRecursive(apdu.data)
+                recordTlvList.forEach { tlv ->
+                    transactionData[tlv.tag.hex] = tlv.value
                 }
             }
 
@@ -541,14 +551,16 @@ class UnionPayContactlessKernel(
         // Always request ARQC for SoftPOS
         val acType = 0x80
 
-        val genAcCmd = byteArrayOf(
-            0x80.toByte(), 0xAE.toByte(),
-            acType.toByte(), 0x00,
-            cdolData.size.toByte()
-        ) + cdolData + byteArrayOf(0x00)
+        val genAcCmd = CommandApdu(
+            cla = 0x80.toByte(),
+            ins = 0xAE.toByte(),
+            p1 = acType.toByte(),
+            p2 = 0x00,
+            data = cdolData,
+            le = 0
+        )
 
-        val response = transceiver.transceive(genAcCmd)
-        val apdu = ResponseApdu.parse(response)
+        val apdu = transceiver.transceive(genAcCmd)
 
         if (!apdu.isSuccess) {
             return UnionPayKernelOutcome(
@@ -606,20 +618,20 @@ class UnionPayContactlessKernel(
     }
 
     private fun parseGenerateAcResponse(data: ByteArray, cvmResult: UnionPayCvmResult): UnionPayKernelOutcome {
-        val tlv = if (data[0] == 0x77.toByte() || data[0] == 0x80.toByte()) {
-            tlvParser.parse(data)
+        val tlvMap: Map<String, ByteArray> = if (data.isNotEmpty() && (data[0] == 0x77.toByte() || data[0] == 0x80.toByte())) {
+            TlvParser.parseRecursive(data).associateBy({ it.tag.hex }, { it.value })
         } else {
             mapOf()
         }
 
-        val cid = tlv["9F27"]?.firstOrNull()?.toInt()?.and(0xFF) ?: 0x80
+        val cid = tlvMap["9F27"]?.firstOrNull()?.toInt()?.and(0xFF) ?: 0x80
         val cryptogramType = (cid and 0xC0) shr 6
 
-        val cryptogram = tlv["9F26"]
-        val atc = tlv["9F36"]
-        val iad = tlv["9F10"]
+        val cryptogram = tlvMap["9F26"]
+        val atc = tlvMap["9F36"]
+        val iad = tlvMap["9F10"]
 
-        tlv.forEach { (tag, value) ->
+        tlvMap.forEach { (tag, value) ->
             transactionData[tag] = value
         }
 
@@ -700,7 +712,7 @@ sealed class UnionPaySelectResult {
         val preferredName: String?
     ) : UnionPaySelectResult()
 
-    data class Failed(val sw1: Byte, val sw2: Byte) : UnionPaySelectResult()
+    data class Failed(val sw1: Int, val sw2: Int) : UnionPaySelectResult()
 }
 
 sealed class UnionPayGpoResult {
@@ -710,7 +722,7 @@ sealed class UnionPayGpoResult {
         val responseData: Map<String, ByteArray>
     ) : UnionPayGpoResult()
 
-    data class Failed(val sw1: Byte, val sw2: Byte) : UnionPayGpoResult()
+    data class Failed(val sw1: Int, val sw2: Int) : UnionPayGpoResult()
     object TryAnotherInterface : UnionPayGpoResult()
 }
 

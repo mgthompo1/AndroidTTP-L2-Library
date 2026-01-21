@@ -300,6 +300,48 @@ object EmvCrypto {
         MAC(0x01),     // MAC
         ENC(0x02)      // Encryption
     }
+
+    /**
+     * Triple DES encryption
+     * Used for PIN block encryption in Format 0
+     *
+     * @param data The data to encrypt (must be multiple of 8 bytes)
+     * @param key The encryption key (16 or 24 bytes)
+     * @return Encrypted data
+     */
+    fun encryptTripleDes(data: ByteArray, key: ByteArray): ByteArray {
+        val cipher = Cipher.getInstance("DESede/ECB/NoPadding")
+        // Expand 16-byte key to 24-byte by copying first 8 bytes
+        val expandedKey = if (key.size == 16) {
+            key + key.copyOfRange(0, 8)
+        } else {
+            key
+        }
+        val keySpec = SecretKeySpec(expandedKey, "DESede")
+        cipher.init(Cipher.ENCRYPT_MODE, keySpec)
+        return cipher.doFinal(data)
+    }
+
+    /**
+     * Triple DES decryption
+     * Used for PIN block decryption
+     *
+     * @param data The data to decrypt (must be multiple of 8 bytes)
+     * @param key The decryption key (16 or 24 bytes)
+     * @return Decrypted data
+     */
+    fun decryptTripleDes(data: ByteArray, key: ByteArray): ByteArray {
+        val cipher = Cipher.getInstance("DESede/ECB/NoPadding")
+        // Expand 16-byte key to 24-byte by copying first 8 bytes
+        val expandedKey = if (key.size == 16) {
+            key + key.copyOfRange(0, 8)
+        } else {
+            key
+        }
+        val keySpec = SecretKeySpec(expandedKey, "DESede")
+        cipher.init(Cipher.DECRYPT_MODE, keySpec)
+        return cipher.doFinal(data)
+    }
 }
 
 /**

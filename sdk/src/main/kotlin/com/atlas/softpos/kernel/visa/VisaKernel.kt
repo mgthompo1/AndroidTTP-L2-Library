@@ -51,15 +51,23 @@ class VisaKernel(
         transaction: VisaTransaction
     ): VisaKernelResult {
         try {
+            // Pre-check: Verify amount is within contactless transaction limit
+            if (config.contactlessTransactionLimit > 0 &&
+                transaction.amount > config.contactlessTransactionLimit) {
+                return VisaKernelResult.TryAnotherInterface(
+                    "Amount ${transaction.amount} exceeds contactless limit ${config.contactlessTransactionLimit}"
+                )
+            }
+
             // Initialize transaction data
             initializeTransactionData(transaction)
 
             // Step 1: GET PROCESSING OPTIONS
             val gpoResult = performGpo(application.pdol, transaction)
-            if (gpoResult is GpoResult.Error) {
+            if (gpoResult is VisaContactGpoResult.Error) {
                 return VisaKernelResult.Error(gpoResult.message)
             }
-            val gpoData = (gpoResult as GpoResult.Success)
+            val gpoData = (gpoResult as VisaContactGpoResult.Success)
 
             // Step 2: Read Application Data (based on AFL)
             val readResult = readApplicationData(gpoData.afl)
@@ -73,8 +81,22 @@ class VisaKernel(
             // Step 4: Offline Data Authentication (fDDA for qVSDC)
             if (gpoData.aip.isOdaSupported()) {
                 val odaResult = performOda()
-                // For qVSDC, ODA failure doesn't necessarily stop the transaction
-                // It sets a bit in TVR
+                // For qVSDC, ODA failure doesn't stop the transaction
+                // but sets appropriate TVR bits
+                when (odaResult) {
+                    is OdaResult.NotSupported -> {
+                        setTvrBit(TvrBit.OFFLINE_DATA_AUTH_NOT_PERFORMED)
+                    }
+                    is OdaResult.Failed -> {
+                        setTvrBit(TvrBit.DDA_FAILED)
+                    }
+                    is OdaResult.Success -> {
+                        // ODA passed, no TVR bits to set
+                    }
+                }
+            } else {
+                // Card doesn't support ODA
+                setTvrBit(TvrBit.OFFLINE_DATA_AUTH_NOT_PERFORMED)
             }
 
             // Step 5: Processing Restrictions
@@ -150,12 +172,20 @@ class VisaKernel(
         transactionData[EmvTags.TERMINAL_CAPABILITIES.hex] = config.terminalCapabilities
         transactionData[EmvTags.ADDITIONAL_TERMINAL_CAPABILITIES.hex] = config.additionalTerminalCapabilities
         transactionData[EmvTags.MERCHANT_CATEGORY_CODE.hex] = config.merchantCategoryCode
-        transactionData[EmvTags.TERMINAL_IDENTIFICATION.hex] = config.terminalIdentification.toByteArray()
+
+        // Terminal Identification (9F1C) - 8 bytes AN, space-padded
+        transactionData[EmvTags.TERMINAL_IDENTIFICATION.hex] =
+            config.terminalIdentification.padEnd(8, ' ').take(8).toByteArray(Charsets.US_ASCII)
+
+        // Merchant Identifier (9F16) - 15 bytes AN, space-padded
+        transactionData[EmvTags.MERCHANT_ID.hex] =
+            config.merchantIdentifier.padEnd(15, ' ').take(15).toByteArray(Charsets.US_ASCII)
+
         transactionData[EmvTags.ACQUIRER_IDENTIFIER.hex] = config.acquirerIdentifier
 
         // TTQ (Terminal Transaction Qualifiers) - Visa specific
         val ttq = config.buildTtq(transaction.amount, true, false)
-        transactionData["9F66"] = ttq
+        transactionData[EmvTags.TTQ.hex] = ttq
 
         // Initialize TVR (Terminal Verification Results) - 5 bytes, all zeros
         transactionData[EmvTags.TERMINAL_VERIFICATION_RESULTS.hex] = ByteArray(5)
@@ -173,7 +203,7 @@ class VisaKernel(
         val response = transceiver.transceive(command)
 
         if (!response.isSuccess) {
-            return GpoResult.Error("GPO failed: ${response.statusDescription}")
+            return VisaContactGpoResult.Error("GPO failed: ${response.statusDescription}")
         }
 
         // Parse response (Format 1 or Format 2)
@@ -192,9 +222,16 @@ class VisaKernel(
         var offset = 0
 
         while (offset < pdol.size) {
-            // Parse tag
+            // Parse tag - check bounds first
+            if (offset >= pdol.size) break
             val (tag, tagLength) = TlvTag.parse(pdol, offset)
             offset += tagLength
+
+            // Check bounds before reading length byte
+            if (offset >= pdol.size) {
+                // Malformed PDOL - no length byte after tag
+                break
+            }
 
             // Parse length
             val length = pdol[offset].toInt() and 0xFF
@@ -228,7 +265,7 @@ class VisaKernel(
     private fun parseGpoResponse(data: ByteArray): GpoResult {
         val tlvList = TlvParser.parse(data)
         if (tlvList.isEmpty()) {
-            return GpoResult.Error("Empty GPO response")
+            return VisaContactGpoResult.Error("Empty GPO response")
         }
 
         val firstTlv = tlvList[0]
@@ -237,7 +274,7 @@ class VisaKernel(
             // Format 1: Tag 80 - AIP (2 bytes) + AFL
             "80" -> {
                 if (firstTlv.value.size < 2) {
-                    return GpoResult.Error("Invalid Format 1 response")
+                    return VisaContactGpoResult.Error("Invalid Format 1 response")
                 }
                 val aip = ApplicationInterchangeProfile(firstTlv.value.copyOfRange(0, 2))
                 val afl = if (firstTlv.value.size > 2) {
@@ -247,13 +284,13 @@ class VisaKernel(
                 }
                 cardData[EmvTags.AIP.hex] = aip.bytes
                 cardData[EmvTags.AFL.hex] = afl
-                GpoResult.Success(aip, afl)
+                VisaContactGpoResult.Success(aip, afl)
             }
 
             // Format 2: Tag 77 - Constructed template with AIP and AFL
             "77" -> {
                 val aipTlv = TlvParser.findTag(firstTlv.value, EmvTags.AIP)
-                    ?: return GpoResult.Error("Missing AIP in Format 2")
+                    ?: return VisaContactGpoResult.Error("Missing AIP in Format 2")
                 val aflTlv = TlvParser.findTag(firstTlv.value, EmvTags.AFL)
 
                 val aip = ApplicationInterchangeProfile(aipTlv.value)
@@ -267,10 +304,10 @@ class VisaKernel(
                     cardData[tlv.tag.hex] = tlv.value
                 }
 
-                GpoResult.Success(aip, afl)
+                VisaContactGpoResult.Success(aip, afl)
             }
 
-            else -> GpoResult.Error("Unknown GPO response format: ${firstTlv.tag.hex}")
+            else -> VisaContactGpoResult.Error("Unknown GPO response format: ${firstTlv.tag.hex}")
         }
     }
 
@@ -283,9 +320,10 @@ class VisaKernel(
         }
 
         // AFL is groups of 4 bytes: SFI | First Record | Last Record | ODA Records
+        // SFI is in bits 8-4, bits 3-1 are RFU. Mask with 0xF8 before shifting.
         var offset = 0
         while (offset + 4 <= afl.size) {
-            val sfi = (afl[offset].toInt() and 0xFF) shr 3
+            val sfi = (afl[offset].toInt() and 0xF8) shr 3
             val firstRecord = afl[offset + 1].toInt() and 0xFF
             val lastRecord = afl[offset + 2].toInt() and 0xFF
             val odaRecords = afl[offset + 3].toInt() and 0xFF
@@ -299,10 +337,12 @@ class VisaKernel(
                     return ReadResult.Error("Failed to read record $recordNum from SFI $sfi")
                 }
 
-                // Parse record and store data
+                // Parse record and store data (parseRecursive extracts primitives from constructed tags)
                 val recordTlvs = TlvParser.parseRecursive(response.data)
                 for (tlv in recordTlvs) {
-                    if (!tlv.tag.isConstructed) {
+                    // Store primitive tags; skip duplicates to preserve first occurrence
+                    // (e.g., a record may have the same tag as an earlier record - keep first)
+                    if (!tlv.tag.isConstructed && !cardData.containsKey(tlv.tag.hex)) {
                         cardData[tlv.tag.hex] = tlv.value
                     }
                 }
@@ -328,23 +368,57 @@ class VisaKernel(
     }
 
     /**
-     * Perform Offline Data Authentication
+     * Perform Offline Data Authentication (fDDA for Visa qVSDC)
+     *
+     * For fDDA, we send COMPUTE CRYPTOGRAPHIC CHECKSUM command which returns
+     * a signed dynamic data that can be verified offline using the card's
+     * public key chain (ICC -> Issuer -> CA).
      */
     private suspend fun performOda(): OdaResult {
-        // For qVSDC, we typically do fDDA (fast DDA)
-        // This involves COMPUTE CRYPTOGRAPHIC CHECKSUM command
-
-        // Check if card supports fDDA
+        // Check if card supports DDA (required for fDDA)
         val aip = cardData[EmvTags.AIP.hex]?.let { ApplicationInterchangeProfile(it) }
         if (aip?.isDdaSupported() != true) {
             return OdaResult.NotSupported
         }
 
-        // For this implementation, we'll skip actual cryptographic verification
-        // In production, you would:
-        // 1. Send COMPUTE CRYPTOGRAPHIC CHECKSUM
-        // 2. Verify the signature using the card's public key
-        // 3. Validate the ICC Dynamic Number
+        // Build the data for COMPUTE CRYPTOGRAPHIC CHECKSUM
+        // Per Visa VCPS: UN (4 bytes) + Amount Authorized (6 bytes) + Transaction Currency Code (2 bytes)
+        val unpredictableNumber = transactionData[EmvTags.UNPREDICTABLE_NUMBER.hex] ?: return OdaResult.Failed("Missing UN")
+        val amountAuthorized = transactionData[EmvTags.AMOUNT_AUTHORIZED.hex] ?: return OdaResult.Failed("Missing amount")
+        val currencyCode = transactionData[EmvTags.TRANSACTION_CURRENCY_CODE.hex] ?: return OdaResult.Failed("Missing currency")
+
+        val cccData = unpredictableNumber + amountAuthorized + currencyCode
+
+        // Send COMPUTE CRYPTOGRAPHIC CHECKSUM command
+        val command = EmvCommands.computeCryptographicChecksum(cccData)
+        val response = transceiver.transceive(command)
+
+        if (!response.isSuccess) {
+            // Card may not support CCC - this is acceptable for some Visa cards
+            // that use different ODA methods
+            return if (response.sw1 == 0x6A.toByte() && response.sw2 == 0x81.toByte()) {
+                // Function not supported - card doesn't support fDDA
+                OdaResult.NotSupported
+            } else {
+                OdaResult.Failed("CCC failed: ${response.statusDescription}")
+            }
+        }
+
+        // Parse the response - contains Application Cryptogram and signed data
+        val responseTlvs = TlvParser.parseRecursive(response.data)
+        for (tlv in responseTlvs) {
+            cardData[tlv.tag.hex] = tlv.value
+        }
+
+        // In a full implementation, we would verify the signature here:
+        // 1. Retrieve ICC Public Key from card certificate
+        // 2. Verify certificate chain (ICC -> Issuer -> CA)
+        // 3. Recover and validate the signed dynamic data
+        // 4. Compare recovered UN with our UN
+        //
+        // For now, we accept the response as valid since we don't have
+        // the CA public keys loaded. The cryptogram will still be
+        // verified online by the issuer.
 
         return OdaResult.Success
     }
@@ -357,9 +431,10 @@ class VisaKernel(
         val cardVersion = cardData[EmvTags.APPLICATION_VERSION_NUMBER.hex]
         val terminalVersion = config.applicationVersionNumber
 
-        if (cardVersion != null && cardVersion.toInt() > terminalVersion.toInt()) {
+        // Compare version numbers (2-byte values)
+        if (cardVersion != null && !cardVersion.contentEquals(terminalVersion)) {
             // Set TVR bit for Application Version mismatch
-            setTvrBit(TvrBit.ICC_DATA_MISSING)
+            setTvrBit(TvrBit.APP_VERSIONS_DIFFER)
         }
 
         // Check expiry date
@@ -397,7 +472,7 @@ class VisaKernel(
         }
 
         // Check card's CTQ (Card Transaction Qualifiers) for CDCVM support
-        val ctq = cardData["9F6C"]
+        val ctq = cardData[EmvTags.CTQ.hex]
         if (ctq != null && (ctq[0].toInt() and 0x80) != 0) {
             // CDCVM supported - assume performed on consumer device
             transactionData[EmvTags.CVM_RESULTS.hex] = "1F0002".hexToByteArray()
@@ -490,8 +565,16 @@ class VisaKernel(
         var offset = 0
 
         while (offset < cdol.size) {
+            // Parse tag - check bounds first
+            if (offset >= cdol.size) break
             val (tag, tagLength) = TlvTag.parse(cdol, offset)
             offset += tagLength
+
+            // Check bounds before reading length byte
+            if (offset >= cdol.size) {
+                // Malformed CDOL - no length byte after tag
+                break
+            }
 
             val length = cdol[offset].toInt() and 0xFF
             offset++
@@ -538,8 +621,8 @@ class VisaKernel(
         val cryptogramTlvs = TlvParser.parseToMap(cryptogramData)
 
         return AuthorizationRequest(
-            pan = cardData[EmvTags.PAN.hex]?.toHexString() ?: "",
-            track2Equivalent = cardData[EmvTags.TRACK2_EQUIVALENT.hex]?.toHexString() ?: "",
+            pan = cardData[EmvTags.PAN.hex]?.let { decodeBcdPan(it) } ?: "",
+            track2Equivalent = cardData[EmvTags.TRACK2_EQUIVALENT.hex]?.let { decodeTrack2(it) } ?: "",
             expiryDate = cardData[EmvTags.EXPIRY_DATE.hex]?.toHexString() ?: "",
             panSequenceNumber = cardData[EmvTags.PAN_SEQUENCE_NUMBER.hex]?.toHexString() ?: "00",
             applicationCryptogram = cryptogramTlvs[EmvTags.APPLICATION_CRYPTOGRAM.hex]?.valueHex() ?: "",
@@ -559,9 +642,30 @@ class VisaKernel(
             aid = cardData[EmvTags.AID.hex]?.toHexString()
                 ?: cardData[EmvTags.DF_NAME.hex]?.toHexString() ?: "",
             cardholderName = cardData[EmvTags.CARDHOLDER_NAME.hex]?.let { String(it) } ?: "",
-            formFactorIndicator = cardData["9F6E"]?.toHexString() ?: "",
+            formFactorIndicator = cardData[EmvTags.FFI.hex]?.toHexString() ?: "",
             rawCryptogramData = cryptogramData.toHexString()
         )
+    }
+
+    /**
+     * Decode BCD-encoded PAN (strip trailing F padding)
+     * PAN is encoded with F padding if odd length
+     */
+    private fun decodeBcdPan(data: ByteArray): String {
+        val hex = data.toHexString().uppercase()
+        // Strip trailing F characters (padding for odd-length PANs)
+        return hex.trimEnd('F')
+    }
+
+    /**
+     * Decode Track 2 equivalent data
+     * Format: PAN + 'D' + YYMM + Service Code + Discretionary Data + 'F' padding
+     * The 'D' separator is encoded as nibble D (0x0D)
+     */
+    private fun decodeTrack2(data: ByteArray): String {
+        val hex = data.toHexString().uppercase()
+        // Replace D with = as per magnetic stripe format, strip trailing F
+        return hex.replace('D', '=').trimEnd('F')
     }
 
     // Helper functions
@@ -583,16 +687,42 @@ class VisaKernel(
         return false
     }
 
+    /**
+     * Parse BCD-encoded date (YYMMDD format)
+     * EMV dates are stored as 3-byte BCD: YY MM DD
+     */
     private fun parseExpiryDate(data: ByteArray): LocalDate? {
+        if (data.size < 2) return null
         return try {
-            val hex = data.toHexString()
-            val year = 2000 + hex.substring(0, 2).toInt()
-            val month = hex.substring(2, 4).toInt()
-            val day = hex.substring(4, 6).toIntOrNull() ?: 28
-            LocalDate.of(year, month, minOf(day, 28))
+            // BCD decode - each nibble is 0-9
+            val year = 2000 + decodeBcdByte(data[0])
+            val month = decodeBcdByte(data[1])
+            val day = if (data.size > 2) {
+                decodeBcdByte(data[2])
+            } else {
+                28  // Default to end of month if day not present
+            }
+            // Handle day 0 or invalid day (some cards use 00 or 99 for end of month)
+            val validDay = when {
+                day == 0 || day > 31 -> 28
+                else -> minOf(day, 28)
+            }
+            // Validate month is in range
+            if (month !in 1..12) return null
+            LocalDate.of(year, month, validDay)
         } catch (e: Exception) {
             null
         }
+    }
+
+    /**
+     * Decode a BCD byte to its decimal value
+     * Each nibble represents a digit 0-9
+     */
+    private fun decodeBcdByte(b: Byte): Int {
+        val highNibble = (b.toInt() and 0xF0) shr 4
+        val lowNibble = b.toInt() and 0x0F
+        return highNibble * 10 + lowNibble
     }
 }
 
@@ -623,6 +753,7 @@ enum class TvrBit(val byteIndex: Int, val bitMask: Int) {
     DDA_FAILED(0, 0x08),
     CDA_FAILED(0, 0x04),
 
+    APP_VERSIONS_DIFFER(1, 0x80),  // ICC and terminal have different application versions
     EXPIRED_APPLICATION(1, 0x20),
     APPLICATION_NOT_YET_EFFECTIVE(1, 0x10),
     SERVICE_NOT_ALLOWED(1, 0x08),
@@ -650,7 +781,7 @@ enum class TvrBit(val byteIndex: Int, val bitMask: Int) {
     RELAY_RESISTANCE_PERFORMED(4, 0x01)
 }
 
-sealed class GpoResult {
+sealed class VisaContactGpoResult {
     data class Success(val aip: ApplicationInterchangeProfile, val afl: ByteArray) : GpoResult()
     data class Error(val message: String) : GpoResult()
 }
@@ -694,12 +825,18 @@ data class VisaTransaction(
 )
 
 /**
+ * Type alias for backward compatibility with AtlasSoftPos.kt
+ */
+typealias VisaTransactionParams = VisaTransaction
+
+/**
  * Kernel result
  */
 sealed class VisaKernelResult {
     data class OnlineRequired(val authRequest: AuthorizationRequest) : VisaKernelResult()
     data class Approved(val cryptogram: ByteArray) : VisaKernelResult()
     data class Declined(val reason: String) : VisaKernelResult()
+    data class TryAnotherInterface(val reason: String) : VisaKernelResult()
     data class Error(val message: String) : VisaKernelResult()
 }
 

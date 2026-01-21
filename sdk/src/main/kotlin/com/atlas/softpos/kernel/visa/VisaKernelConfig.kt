@@ -104,9 +104,15 @@ data class VisaKernelConfig(
     /**
      * Terminal Action Codes
      * Specify when to decline/go online based on TVR
+     *
+     * TAC Denial: If any TVR bit matching this mask is set, decline offline
+     * TAC Online: If any TVR bit matching this mask is set, go online
+     * TAC Default: Used when neither denial nor online conditions match
+     *              (Currently not implemented - kernel defaults to online for qVSDC)
      */
     val tacDenial: ByteArray = "0010000000".hexToByteArray(),
     val tacOnline: ByteArray = "F850ACF800".hexToByteArray(),
+    @Suppress("unused")  // Reserved for future three-step TAA implementation
     val tacDefault: ByteArray = "F850ACF800".hexToByteArray(),
 
     /**
@@ -144,41 +150,89 @@ data class VisaKernelConfig(
      */
     val defaultTtq: ByteArray = "36000000".hexToByteArray()
 ) {
+    // TTQ bit masks
+    companion object {
+        // Byte 1 masks
+        private const val TTQ_OFFLINE_ONLY: Int = 0x08        // bit 4: Reader is offline only
+
+        // Byte 2 masks
+        private const val TTQ_ONLINE_CRYPT_REQ: Int = 0x80    // bit 8: Online cryptogram required
+        private const val TTQ_CVM_REQUIRED: Int = 0x40        // bit 7: CVM required
+
+        // Byte 3 masks
+        private const val TTQ_CDCVM_PERFORMED: Int = 0x40     // bit 7: Consumer Device CVM performed
+    }
+
     /**
      * Build TTQ based on transaction parameters
+     *
+     * Starts from defaultTtq and modifies bits based on:
+     * - isOnlineCapable: Clear/set offline-only bit
+     * - amount vs cvmRequiredLimit: Set CVM required and online cryptogram required
+     * - cvmPerformed: Set CDCVM performed bit
      */
     fun buildTtq(
         amount: Long,
         isOnlineCapable: Boolean = true,
         cvmPerformed: Boolean = false
     ): ByteArray {
-        var byte1 = 0x26  // qVSDC supported, ODA supported
+        // Start from configured default TTQ
+        val ttq = defaultTtq.copyOf()
 
-        if (isOnlineCapable) {
-            byte1 = byte1 or 0x10  // Not offline only
+        // Byte 1: Set offline-only bit based on terminal capability
+        if (!isOnlineCapable) {
+            // Terminal is offline only - set the bit
+            ttq[0] = (ttq[0].toInt() or TTQ_OFFLINE_ONLY).toByte()
+        } else {
+            // Terminal is online capable - clear the bit
+            ttq[0] = (ttq[0].toInt() and TTQ_OFFLINE_ONLY.inv()).toByte()
         }
 
-        // Check if CVM is required based on amount
+        // Byte 2: Online cryptogram required and CVM required
         val cvmRequired = amount > cvmRequiredLimit
 
-        var byte2 = 0x00
-        if (!isOnlineCapable || cvmRequired) {
-            byte2 = byte2 or 0x80  // Online cryptogram required
+        if (isOnlineCapable) {
+            // For online-capable terminals, request online cryptogram for qVSDC
+            ttq[1] = (ttq[1].toInt() or TTQ_ONLINE_CRYPT_REQ).toByte()
         }
+        // Note: Don't set online cryptogram required if offline-only - that's contradictory
+
         if (cvmRequired) {
-            byte2 = byte2 or 0x40  // CVM required
+            ttq[1] = (ttq[1].toInt() or TTQ_CVM_REQUIRED).toByte()
         }
 
-        var byte3 = 0x00
+        // Byte 3: Consumer Device CVM performed
         if (cvmPerformed) {
-            byte3 = byte3 or 0x40  // Consumer Device CVM performed
+            ttq[2] = (ttq[2].toInt() or TTQ_CDCVM_PERFORMED).toByte()
         }
 
-        return byteArrayOf(
-            byte1.toByte(),
-            byte2.toByte(),
-            byte3.toByte(),
-            0x00
+        return ttq
+    }
+
+    /**
+     * Convert to VisaKernelConfiguration for use with VisaContactlessKernel
+     */
+    fun toKernelConfiguration(): VisaKernelConfiguration {
+        return VisaKernelConfiguration(
+            terminalCountryCode = terminalCountryCode,
+            transactionCurrencyCode = transactionCurrencyCode,
+            terminalCapabilities = terminalCapabilities,
+            terminalType = terminalType,
+            additionalTerminalCapabilities = additionalTerminalCapabilities,
+            ifdSerialNumber = terminalIdentification.toByteArray(),
+            merchantCategoryCode = merchantCategoryCode,
+            terminalFloorLimit = terminalFloorLimit,
+            cvmRequiredLimit = cvmRequiredLimit,
+            contactlessTransactionLimit = contactlessTransactionLimit,
+            acquirerId = acquirerIdentifier,
+            terminalId = terminalIdentification.toByteArray(),
+            merchantId = merchantIdentifier.toByteArray(),
+            supportMsd = false,
+            supportOnlinePin = false,
+            supportSignature = false,
+            tacDenial = tacDenial,
+            tacOnline = tacOnline,
+            tacDefault = tacDefault
         )
     }
 }
@@ -211,9 +265,12 @@ enum class CvmType(val code: Byte) {
 }
 
 /**
- * Outcome of kernel processing
+ * Outcome of Visa kernel processing
+ *
+ * Note: This is separate from kernel.common.KernelOutcome which is used by
+ * the generic kernel state machine. This enum is specific to Visa kernel results.
  */
-enum class KernelOutcome {
+enum class VisaOutcome {
     APPROVED,           // Offline approval (TC received)
     ONLINE_REQUEST,     // Go online for authorization (ARQC received)
     DECLINED,           // Offline decline (AAC received)

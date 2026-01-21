@@ -8,6 +8,7 @@ import com.atlas.softpos.core.tlv.TlvParser
 import com.atlas.softpos.core.tlv.TlvTag
 import com.atlas.softpos.crypto.OfflineDataAuthentication
 import com.atlas.softpos.crypto.OdaResult
+import com.atlas.softpos.crypto.StandaloneOdaProcessor
 import com.atlas.softpos.kernel.common.CardTransceiver
 import com.atlas.softpos.kernel.common.SelectedApplication
 import com.atlas.softpos.kernel.common.TerminalVerificationResults
@@ -204,7 +205,7 @@ class MastercardContactlessKernel(
 
         if (!response.isSuccess) {
             Timber.w("GPO failed: SW=${response.sw1}${response.sw2}")
-            return GpoResult.Error(mapSwToError(response.sw1, response.sw2))
+            return GpoResult.Error(mapSwToError(response.sw1.toInt() and 0xFF, response.sw2.toInt() and 0xFF))
         }
 
         return parseGpoResponse(response.data)
@@ -535,7 +536,7 @@ class MastercardContactlessKernel(
         // Get terminal data for dynamic authentication
         val unpredictableNumber = terminalData.get(0x9F37) ?: ByteArray(4)
 
-        val result = odaProcessor?.performFdda(
+        val result = StandaloneOdaProcessor.performFdda(
             aid = aid,
             issuerPkCertificate = issuerPkCert,
             issuerPkExponent = cardData[0x9F32] ?: byteArrayOf(0x03),
@@ -547,16 +548,25 @@ class MastercardContactlessKernel(
         )
 
         when (result) {
-            is OdaResult.Success -> {
+            is OdaResult.FddaSuccess -> {
                 Timber.d("fDDA successful")
                 odaStatus = OdaStatus.Successful
             }
-            is OdaResult.Failure -> {
-                Timber.w("fDDA failed: ${result.reason}")
+            is OdaResult.DdaSuccess -> {
+                Timber.d("DDA successful")
+                odaStatus = OdaStatus.Successful
+            }
+            is OdaResult.Failed -> {
+                Timber.w("fDDA failed: ${result.failureReason}")
                 tvr.ddaFailed = true
                 odaStatus = OdaStatus.Failed
             }
             null -> {
+                tvr.ddaFailed = true
+                odaStatus = OdaStatus.Failed
+            }
+            else -> {
+                Timber.w("Unexpected ODA result: $result")
                 tvr.ddaFailed = true
                 odaStatus = OdaStatus.Failed
             }
@@ -585,7 +595,7 @@ class MastercardContactlessKernel(
         val aipBytes = cardData[0x82] ?: ByteArray(2)
         val staticDataToAuthenticate = buildStaticDataForAuth(aipBytes)
 
-        val result = odaProcessor?.performSda(
+        val result = StandaloneOdaProcessor.performSda(
             aid = aid,
             issuerPkCertificate = issuerPkCert,
             issuerPkExponent = cardData[0x9F32] ?: byteArrayOf(0x03),
@@ -594,16 +604,21 @@ class MastercardContactlessKernel(
         )
 
         when (result) {
-            is OdaResult.Success -> {
+            is OdaResult.SdaSuccess -> {
                 Timber.d("SDA successful")
                 odaStatus = OdaStatus.Successful
             }
-            is OdaResult.Failure -> {
-                Timber.w("SDA failed: ${result.reason}")
+            is OdaResult.Failed -> {
+                Timber.w("SDA failed: ${result.failureReason}")
                 tvr.sdaFailed = true
                 odaStatus = OdaStatus.Failed
             }
             null -> {
+                tvr.sdaFailed = true
+                odaStatus = OdaStatus.Failed
+            }
+            else -> {
+                Timber.w("Unexpected ODA result: $result")
                 tvr.sdaFailed = true
                 odaStatus = OdaStatus.Failed
             }
@@ -1038,7 +1053,7 @@ class MastercardContactlessKernel(
 
         if (!response.isSuccess) {
             Timber.w("GENERATE AC failed: SW=${response.sw1}${response.sw2}")
-            return GenerateAcResult.Error(mapSwToError(response.sw1, response.sw2))
+            return GenerateAcResult.Error(mapSwToError(response.sw1.toInt() and 0xFF, response.sw2.toInt() and 0xFF))
         }
 
         return parseGenerateAcResponse(response.data, requestCda)
@@ -1188,7 +1203,7 @@ class MastercardContactlessKernel(
         val staticData = buildStaticDataForAuth(aipBytes)
         val unpredictableNumber = terminalData.get(0x9F37) ?: ByteArray(4)
 
-        val result = odaProcessor.performCda(
+        val result = StandaloneOdaProcessor.performCda(
             aid = aid,
             issuerPkCertificate = issuerPkCert,
             issuerPkExponent = cardData[0x9F32] ?: byteArrayOf(0x03),
@@ -1201,12 +1216,26 @@ class MastercardContactlessKernel(
         )
 
         when (result) {
-            is OdaResult.Success -> {
+            is OdaResult.CdaPrepared, is OdaResult.SdaSuccess, is OdaResult.DdaSuccess, is OdaResult.FddaSuccess -> {
                 Timber.d("CDA verification successful")
                 odaStatus = OdaStatus.Successful
             }
+            is OdaResult.Failed -> {
+                Timber.w("CDA verification failed: ${result.failureReason}")
+                tvr.cdaFailed = true
+                odaStatus = OdaStatus.Failed
+            }
+            is OdaResult.NotSupported -> {
+                Timber.w("CDA not supported")
+                tvr.cdaFailed = true
+                odaStatus = OdaStatus.Failed
+            }
+            is OdaResult.Success -> {
+                Timber.d("ODA successful: ${result.type}")
+                odaStatus = OdaStatus.Successful
+            }
             is OdaResult.Failure -> {
-                Timber.w("CDA verification failed: ${result.reason}")
+                Timber.w("ODA failed: ${result.reason}")
                 tvr.cdaFailed = true
                 odaStatus = OdaStatus.Failed
             }
@@ -1237,7 +1266,7 @@ class MastercardContactlessKernel(
 
         if (!response.isSuccess) {
             Timber.w("CCC failed: SW=${response.sw1}${response.sw2}")
-            return ComputeCccResult.Error(mapSwToError(response.sw1, response.sw2))
+            return ComputeCccResult.Error(mapSwToError(response.sw1.toInt() and 0xFF, response.sw2.toInt() and 0xFF))
         }
 
         // Parse response for CVC3 and other data

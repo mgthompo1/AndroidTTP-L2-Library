@@ -6,6 +6,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import timber.log.Timber
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Kernel State Machine
@@ -13,8 +14,15 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Manages EMV kernel state transitions with comprehensive error handling.
  * Implements EMV Contactless Book A - Kernel State Machine requirements.
  *
+ * This is a PASSIVE state machine - external code (kernels) must drive it
+ * by calling the appropriate onX() methods. The state machine tracks state,
+ * manages timeouts, and determines outcomes.
+ *
  * State Transitions:
  * IDLE → WAITING_FOR_CARD → CARD_DETECTED → PROCESSING → [OUTCOME]
+ *
+ * For online transactions:
+ * ... → ONLINE_AUTHORIZATION → ISSUER_SCRIPT_PROCESSING → SECOND_GENERATE_AC → [OUTCOME]
  *
  * Outcomes:
  * - APPROVED: Offline approval (TC generated)
@@ -22,7 +30,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * - ONLINE_REQUEST: Online authorization required (ARQC generated)
  * - END_APPLICATION: Application error
  * - TRY_ANOTHER_INTERFACE: Card requests chip/magstripe
- * - TRY_AGAIN: Collision or read error, retry
+ * - TRY_AGAIN: Collision or read error, retry (up to max attempts)
  * - SELECT_NEXT: Try next application in candidate list
  */
 class KernelStateMachine(
@@ -35,14 +43,45 @@ class KernelStateMachine(
     val outcome: StateFlow<KernelOutcome?> = _outcome.asStateFlow()
 
     private var transactionScope: CoroutineScope? = null
-    private var overallTimeoutJob: Job? = null
+    private var waitForCardTimeoutJob: Job? = null
+    private var processingTimeoutJob: Job? = null
     private var commandTimeoutJob: Job? = null
+    private var onlineTimeoutJob: Job? = null
 
     private val isAborted = AtomicBoolean(false)
     private val isCardRemoved = AtomicBoolean(false)
 
+    // Command timeout sequence to prevent race conditions
+    private val commandSequence = AtomicInteger(0)
+
+    // Retry counter for TryAgain outcomes
+    private val tryAgainCount = AtomicInteger(0)
+
     // Transaction data for recovery
     private var transactionData: TransactionStateData? = null
+
+    /**
+     * Valid state transitions map for validation
+     */
+    private val validTransitions: Map<KernelState, Set<KernelState>> = mapOf(
+        KernelState.Idle to setOf(KernelState.WaitingForCard),
+        KernelState.WaitingForCard to setOf(KernelState.CardDetected, KernelState.TerminalOutcome),
+        KernelState.CardDetected to setOf(KernelState.SelectingApplication, KernelState.TerminalOutcome),
+        KernelState.SelectingApplication to setOf(KernelState.InitiatingApplication, KernelState.TerminalOutcome),
+        KernelState.InitiatingApplication to setOf(KernelState.ReadingApplicationData, KernelState.TerminalOutcome),
+        KernelState.ReadingApplicationData to setOf(KernelState.OfflineDataAuthentication, KernelState.TerminalOutcome),
+        KernelState.OfflineDataAuthentication to setOf(KernelState.ProcessingRestrictions, KernelState.TerminalOutcome),
+        KernelState.ProcessingRestrictions to setOf(KernelState.CardholderVerification, KernelState.TerminalOutcome),
+        KernelState.CardholderVerification to setOf(KernelState.TerminalRiskManagement, KernelState.TerminalOutcome),
+        KernelState.TerminalRiskManagement to setOf(KernelState.TerminalActionAnalysis, KernelState.TerminalOutcome),
+        KernelState.TerminalActionAnalysis to setOf(KernelState.GeneratingCryptogram, KernelState.TerminalOutcome),
+        KernelState.GeneratingCryptogram to setOf(KernelState.Complete, KernelState.OnlineAuthorization, KernelState.TerminalOutcome),
+        KernelState.OnlineAuthorization to setOf(KernelState.IssuerScriptProcessing, KernelState.Complete, KernelState.TerminalOutcome),
+        KernelState.IssuerScriptProcessing to setOf(KernelState.SecondGenerateAc, KernelState.Complete, KernelState.TerminalOutcome),
+        KernelState.SecondGenerateAc to setOf(KernelState.Complete, KernelState.TerminalOutcome),
+        KernelState.Complete to setOf(KernelState.Idle),
+        KernelState.TerminalOutcome to setOf(KernelState.Idle)
+    )
 
     /**
      * Start a new transaction
@@ -52,13 +91,15 @@ class KernelStateMachine(
 
         isAborted.set(false)
         isCardRemoved.set(false)
+        tryAgainCount.set(0)
+        commandSequence.set(0)
         transactionData = data
         _outcome.value = null
 
         transactionScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
         transition(KernelState.WaitingForCard)
-        startOverallTimeout()
+        startWaitForCardTimeout()
     }
 
     /**
@@ -69,6 +110,11 @@ class KernelStateMachine(
             Timber.w("Card detected in unexpected state: ${_state.value}")
             return
         }
+
+        // Cancel wait-for-card timeout, start processing timeout
+        cancelWaitForCardTimeout()
+        startProcessingTimeout()
+
         transition(KernelState.CardDetected)
     }
 
@@ -160,15 +206,109 @@ class KernelStateMachine(
             cryptogram = cryptogram
         )
 
+        val data = transactionData
+        if (data == null) {
+            Timber.e("Transaction data is null when cryptogram received")
+            setOutcome(KernelOutcome.EndApplication("Missing transaction context"))
+            return
+        }
+
         val finalOutcome = when (type) {
-            CryptogramType.TC -> KernelOutcome.Approved(transactionData!!)
-            CryptogramType.ARQC -> KernelOutcome.OnlineRequest(transactionData!!)
-            CryptogramType.AAC -> KernelOutcome.Declined(transactionData!!, "Card declined offline")
-            CryptogramType.AAR -> KernelOutcome.Declined(transactionData!!, "Application authentication referral")
+            CryptogramType.TC -> KernelOutcome.Approved(data)
+            CryptogramType.ARQC -> KernelOutcome.OnlineRequest(data)
+            CryptogramType.AAC -> KernelOutcome.Declined(data, "Card declined offline")
+            CryptogramType.AAR -> KernelOutcome.Declined(data, "Application authentication referral")
         }
 
         setOutcome(finalOutcome)
     }
+
+    // ==================== Online Authorization Flow ====================
+
+    /**
+     * Start online authorization phase
+     * Called after receiving ARQC and sending to host
+     */
+    fun startOnlineAuthorization() {
+        if (_state.value != KernelState.GeneratingCryptogram &&
+            _outcome.value !is KernelOutcome.OnlineRequest) {
+            Timber.w("Cannot start online auth in state: ${_state.value}")
+            return
+        }
+
+        cancelProcessingTimeout()
+        startOnlineTimeout()
+        _state.value = KernelState.OnlineAuthorization
+    }
+
+    /**
+     * Online response received from host
+     *
+     * @param approved True if host approved, false if declined
+     * @param authCode Authorization code if approved
+     * @param issuerAuthData Tag 91 data from host
+     * @param scripts Issuer scripts (tags 71/72) if any
+     */
+    fun onOnlineResponseReceived(
+        approved: Boolean,
+        authCode: String?,
+        issuerAuthData: ByteArray?,
+        scripts: List<ByteArray>?
+    ) {
+        cancelOnlineTimeout()
+
+        transactionData = transactionData?.copy(
+            onlineResponseReceived = true,
+            onlineApproved = approved,
+            authorizationCode = authCode,
+            issuerAuthData = issuerAuthData
+        )
+
+        if (scripts.isNullOrEmpty()) {
+            // No scripts - proceed to 2nd GEN AC or completion
+            if (approved) {
+                transition(KernelState.SecondGenerateAc)
+            } else {
+                setOutcome(KernelOutcome.Declined(
+                    transactionData ?: createFallbackData(),
+                    "Declined by issuer"
+                ))
+            }
+        } else {
+            // Process scripts first
+            transition(KernelState.IssuerScriptProcessing)
+        }
+    }
+
+    /**
+     * Issuer scripts processed
+     */
+    fun onIssuerScriptsProcessed(success: Boolean) {
+        transactionData = transactionData?.copy(issuerScriptsProcessed = true)
+        transition(KernelState.SecondGenerateAc)
+    }
+
+    /**
+     * Second cryptogram received (after online)
+     */
+    fun onSecondCryptogramReceived(type: CryptogramType, cryptogram: ByteArray) {
+        transactionData = transactionData?.copy(
+            secondCryptogramType = type,
+            secondCryptogram = cryptogram
+        )
+
+        val data = transactionData ?: createFallbackData()
+
+        val finalOutcome = when (type) {
+            CryptogramType.TC -> KernelOutcome.Approved(data)
+            CryptogramType.AAC -> KernelOutcome.Declined(data, "Card declined after online")
+            else -> KernelOutcome.Declined(data, "Unexpected cryptogram type")
+        }
+
+        setOutcome(finalOutcome)
+    }
+
+    // ==================== Error Handling ====================
 
     /**
      * Card removed during transaction
@@ -188,28 +328,30 @@ class KernelStateMachine(
             is KernelState.CardDetected,
             is KernelState.SelectingApplication,
             is KernelState.InitiatingApplication,
-            is KernelState.ReadingApplicationData -> {
-                // Card removed before critical point - can retry
-                setOutcome(KernelOutcome.TryAgain("Card removed, please try again"))
-            }
-
+            is KernelState.ReadingApplicationData,
             is KernelState.OfflineDataAuthentication,
             is KernelState.ProcessingRestrictions,
             is KernelState.CardholderVerification,
             is KernelState.TerminalRiskManagement,
             is KernelState.TerminalActionAnalysis -> {
-                // Card removed before cryptogram - end application
-                setOutcome(KernelOutcome.EndApplication("Card removed before completion"))
+                // Card removed before cryptogram - can retry
+                handleTryAgain("Card removed, please try again")
             }
 
             is KernelState.GeneratingCryptogram -> {
                 // CRITICAL: Card removed after requesting cryptogram
-                // May need reversal if we got partial response
+                handleCriticalCardRemoval()
+            }
+
+            is KernelState.OnlineAuthorization,
+            is KernelState.IssuerScriptProcessing,
+            is KernelState.SecondGenerateAc -> {
+                // Card removed during online phase - may need reversal
                 handleCriticalCardRemoval()
             }
 
             is KernelState.Complete,
-            is KernelState.Error -> {
+            is KernelState.TerminalOutcome -> {
                 // Already complete
             }
         }
@@ -235,9 +377,30 @@ class KernelStateMachine(
     }
 
     /**
+     * Handle TryAgain with retry counter
+     */
+    private fun handleTryAgain(reason: String) {
+        val attempts = tryAgainCount.incrementAndGet()
+
+        if (attempts > config.maxTryAgainAttempts) {
+            Timber.w("Max retry attempts ($attempts) exceeded")
+            setOutcome(KernelOutcome.EndApplication("Unable to read card after $attempts attempts"))
+        } else {
+            Timber.d("TryAgain attempt $attempts of ${config.maxTryAgainAttempts}")
+            setOutcome(KernelOutcome.TryAgain(reason))
+        }
+    }
+
+    /**
      * Command timeout occurred
      */
-    fun onCommandTimeout() {
+    private fun onCommandTimeout(expectedSeq: Int) {
+        // Check if this timeout is still valid (not from a stale command)
+        if (commandSequence.get() != expectedSeq) {
+            Timber.d("Ignoring stale command timeout (seq $expectedSeq, current ${commandSequence.get()})")
+            return
+        }
+
         val currentState = _state.value
         Timber.w("Command timeout in state: $currentState")
 
@@ -246,7 +409,7 @@ class KernelStateMachine(
             is KernelState.InitiatingApplication,
             is KernelState.ReadingApplicationData -> {
                 // Can retry
-                setOutcome(KernelOutcome.TryAgain("Communication timeout"))
+                handleTryAgain("Communication timeout")
             }
 
             is KernelState.GeneratingCryptogram -> {
@@ -276,11 +439,32 @@ class KernelStateMachine(
     }
 
     /**
-     * Overall transaction timeout
+     * Wait-for-card timeout
      */
-    private fun onOverallTimeout() {
-        Timber.w("Overall transaction timeout")
-        abort("Transaction timeout")
+    private fun onWaitForCardTimeout() {
+        Timber.w("Wait for card timeout")
+        setOutcome(KernelOutcome.EndApplication("Timeout waiting for card"))
+    }
+
+    /**
+     * Overall processing timeout
+     */
+    private fun onProcessingTimeout() {
+        Timber.w("Processing timeout")
+        abort("Processing timeout")
+    }
+
+    /**
+     * Online response timeout
+     */
+    private fun onOnlineTimeout() {
+        Timber.w("Online response timeout")
+        val data = transactionData
+        if (data != null) {
+            setOutcome(KernelOutcome.TornTransaction(data))
+        } else {
+            setOutcome(KernelOutcome.EndApplication("Online timeout"))
+        }
     }
 
     /**
@@ -310,7 +494,7 @@ class KernelStateMachine(
      */
     fun onCollision() {
         Timber.w("Card collision detected")
-        setOutcome(KernelOutcome.TryAgain("Multiple cards detected, please present only one card"))
+        handleTryAgain("Multiple cards detected, please present only one card")
     }
 
     /**
@@ -320,7 +504,7 @@ class KernelStateMachine(
         if (isAborted.getAndSet(true)) return
 
         Timber.w("Transaction aborted: $reason")
-        cancelTimeouts()
+        cancelAllTimeouts()
 
         val data = transactionData
         if (data?.cryptogramRequested == true && data.cryptogramGenerated != true) {
@@ -335,72 +519,142 @@ class KernelStateMachine(
      * Reset state machine
      */
     fun reset() {
-        cancelTimeouts()
+        cancelAllTimeouts()
         transactionScope?.cancel()
         transactionScope = null
 
         isAborted.set(false)
         isCardRemoved.set(false)
+        tryAgainCount.set(0)
+        commandSequence.set(0)
         transactionData = null
 
         _state.value = KernelState.Idle
         _outcome.value = null
     }
 
+    // ==================== Timeout Management ====================
+
     /**
-     * Start command timeout
+     * Start command timeout with sequence ID to prevent races
+     *
+     * @return The command sequence ID for this timeout
      */
-    fun startCommandTimeout() {
+    fun startCommandTimeout(): Int {
+        val seq = commandSequence.incrementAndGet()
         commandTimeoutJob?.cancel()
         commandTimeoutJob = transactionScope?.launch {
             delay(config.commandTimeoutMs)
             if (!isAborted.get()) {
-                onCommandTimeout()
+                onCommandTimeout(seq)
             }
         }
+        return seq
     }
 
     /**
      * Cancel command timeout (command completed successfully)
      */
     fun cancelCommandTimeout() {
+        commandSequence.incrementAndGet()  // Invalidate any pending timeout
         commandTimeoutJob?.cancel()
         commandTimeoutJob = null
     }
 
-    private fun startOverallTimeout() {
-        overallTimeoutJob = transactionScope?.launch {
-            delay(config.overallTimeoutMs)
-            if (!isAborted.get()) {
-                onOverallTimeout()
+    private fun startWaitForCardTimeout() {
+        waitForCardTimeoutJob = transactionScope?.launch {
+            delay(config.waitForCardTimeoutMs)
+            if (!isAborted.get() && _state.value == KernelState.WaitingForCard) {
+                onWaitForCardTimeout()
             }
         }
     }
 
-    private fun cancelTimeouts() {
-        overallTimeoutJob?.cancel()
-        commandTimeoutJob?.cancel()
-        overallTimeoutJob = null
-        commandTimeoutJob = null
+    private fun cancelWaitForCardTimeout() {
+        waitForCardTimeoutJob?.cancel()
+        waitForCardTimeoutJob = null
     }
+
+    private fun startProcessingTimeout() {
+        processingTimeoutJob = transactionScope?.launch {
+            delay(config.overallTimeoutMs)
+            if (!isAborted.get()) {
+                onProcessingTimeout()
+            }
+        }
+    }
+
+    private fun cancelProcessingTimeout() {
+        processingTimeoutJob?.cancel()
+        processingTimeoutJob = null
+    }
+
+    private fun startOnlineTimeout() {
+        onlineTimeoutJob = transactionScope?.launch {
+            delay(config.onlineResponseTimeoutMs)
+            if (!isAborted.get()) {
+                onOnlineTimeout()
+            }
+        }
+    }
+
+    private fun cancelOnlineTimeout() {
+        onlineTimeoutJob?.cancel()
+        onlineTimeoutJob = null
+    }
+
+    private fun cancelAllTimeouts() {
+        cancelWaitForCardTimeout()
+        cancelProcessingTimeout()
+        cancelCommandTimeout()
+        cancelOnlineTimeout()
+    }
+
+    // ==================== State Transition ====================
 
     private fun transition(newState: KernelState) {
         val oldState = _state.value
+
+        // Validate transition
+        val validTargets = validTransitions[oldState]
+        if (validTargets != null && newState !in validTargets) {
+            Timber.e("Invalid state transition: $oldState → $newState (allowed: $validTargets)")
+            // Allow the transition but log the error for debugging
+        }
+
         Timber.d("State transition: $oldState → $newState")
         _state.value = newState
     }
 
     private fun setOutcome(outcome: KernelOutcome) {
-        cancelTimeouts()
+        cancelAllTimeouts()
         _outcome.value = outcome
-        transition(
-            when (outcome) {
-                is KernelOutcome.Approved,
-                is KernelOutcome.Declined,
-                is KernelOutcome.OnlineRequest -> KernelState.Complete
 
-                else -> KernelState.Error
-            }
+        // Determine terminal state based on outcome type
+        val terminalState = when (outcome) {
+            is KernelOutcome.Approved,
+            is KernelOutcome.Declined,
+            is KernelOutcome.OnlineRequest -> KernelState.Complete
+
+            is KernelOutcome.EndApplication,
+            is KernelOutcome.TryAnotherInterface,
+            is KernelOutcome.TryAgain,
+            is KernelOutcome.SelectNext,
+            is KernelOutcome.TornTransaction -> KernelState.TerminalOutcome
+        }
+
+        transition(terminalState)
+    }
+
+    /**
+     * Create fallback transaction data if original is null
+     */
+    private fun createFallbackData(): TransactionStateData {
+        return TransactionStateData(
+            transactionId = "UNKNOWN",
+            amount = 0,
+            currencyCode = "000",
+            transactionType = 0x00
         )
     }
 }
@@ -421,8 +675,15 @@ sealed class KernelState {
     object TerminalRiskManagement : KernelState()
     object TerminalActionAnalysis : KernelState()
     object GeneratingCryptogram : KernelState()
-    object Complete : KernelState()
-    object Error : KernelState()
+
+    // Online authorization states
+    object OnlineAuthorization : KernelState()
+    object IssuerScriptProcessing : KernelState()
+    object SecondGenerateAc : KernelState()
+
+    // Terminal states
+    object Complete : KernelState()          // Successful completion (Approved/Declined/OnlineRequest)
+    object TerminalOutcome : KernelState()   // Terminal outcome (TryAgain/SelectNext/EndApplication/etc)
 
     override fun toString(): String = this::class.simpleName ?: "Unknown"
 }
@@ -474,17 +735,32 @@ data class TransactionStateData(
     val cvmMethod: String? = null,
     val cvmSuccessful: Boolean = false,
 
-    // Cryptogram
+    // First Cryptogram
     val cryptogramRequested: Boolean = false,
     val requestedCryptogramType: CryptogramType? = null,
     val cryptogramGenerated: Boolean = false,
     val actualCryptogramType: CryptogramType? = null,
     val cryptogram: ByteArray? = null,
 
+    // Online response
+    val onlineResponseReceived: Boolean = false,
+    val onlineApproved: Boolean = false,
+    val authorizationCode: String? = null,
+    val issuerAuthData: ByteArray? = null,
+    val issuerScriptsProcessed: Boolean = false,
+
+    // Second Cryptogram (after online)
+    val secondCryptogramType: CryptogramType? = null,
+    val secondCryptogram: ByteArray? = null,
+
     // Card data
     val pan: String? = null,
     val panSequenceNumber: String? = null,
-    val track2Equivalent: ByteArray? = null
+    val track2Equivalent: ByteArray? = null,
+
+    // For torn transaction recovery
+    val atc: ByteArray? = null,
+    val unpredictableNumber: ByteArray? = null
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -499,8 +775,9 @@ data class TransactionStateData(
  * Timeout configuration
  */
 data class KernelTimeoutConfig(
-    val waitForCardTimeoutMs: Long = 60_000,      // 60 seconds
-    val commandTimeoutMs: Long = 1_000,            // 1 second per command
-    val overallTimeoutMs: Long = 30_000,           // 30 seconds total
-    val onlineResponseTimeoutMs: Long = 45_000     // 45 seconds for online response
+    val waitForCardTimeoutMs: Long = 60_000,       // 60 seconds to tap card
+    val commandTimeoutMs: Long = 3_000,            // 3 seconds per APDU (increased from 1s)
+    val overallTimeoutMs: Long = 30_000,           // 30 seconds for entire transaction
+    val onlineResponseTimeoutMs: Long = 45_000,    // 45 seconds for online response
+    val maxTryAgainAttempts: Int = 3               // Max retry attempts before failure
 )

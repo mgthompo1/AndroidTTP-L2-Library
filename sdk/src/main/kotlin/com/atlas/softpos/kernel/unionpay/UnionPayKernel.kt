@@ -41,10 +41,10 @@ class UnionPayKernel(
 
             // GET PROCESSING OPTIONS
             val gpoResult = performGpo(application.pdol, transaction)
-            if (gpoResult is UnionPayGpoResult.Error) {
+            if (gpoResult is UnionPayContactGpoResult.Error) {
                 return UnionPayKernelResult.Error(gpoResult.message)
             }
-            val gpoData = (gpoResult as UnionPayGpoResult.Success)
+            val gpoData = (gpoResult as UnionPayContactGpoResult.Success)
 
             // Determine path based on AIP
             val isQpbocMode = gpoData.aip.isQpbocSupported()
@@ -102,7 +102,7 @@ class UnionPayKernel(
         val response = transceiver.transceive(command)
 
         if (!response.isSuccess) {
-            return UnionPayGpoResult.Error("GPO failed: ${response.statusDescription}")
+            return UnionPayContactGpoResult.Error("GPO failed: ${response.statusDescription}")
         }
 
         return parseGpoResponse(response.data)
@@ -134,14 +134,14 @@ class UnionPayKernel(
 
     private fun parseGpoResponse(data: ByteArray): UnionPayGpoResult {
         val tlvList = TlvParser.parse(data)
-        if (tlvList.isEmpty()) return UnionPayGpoResult.Error("Empty GPO response")
+        if (tlvList.isEmpty()) return UnionPayContactGpoResult.Error("Empty GPO response")
 
         val firstTlv = tlvList[0]
 
         return when (firstTlv.tag.hex) {
             "80" -> {
                 if (firstTlv.value.size < 2) {
-                    return UnionPayGpoResult.Error("Invalid Format 1 response")
+                    return UnionPayContactGpoResult.Error("Invalid Format 1 response")
                 }
                 val aip = UnionPayAip(firstTlv.value.copyOfRange(0, 2))
                 val afl = if (firstTlv.value.size > 2) {
@@ -150,11 +150,11 @@ class UnionPayKernel(
 
                 cardData[EmvTags.AIP.hex] = aip.bytes
                 cardData[EmvTags.AFL.hex] = afl
-                UnionPayGpoResult.Success(aip, afl)
+                UnionPayContactGpoResult.Success(aip, afl)
             }
             "77" -> {
                 val aipTlv = TlvParser.findTag(firstTlv.value, EmvTags.AIP)
-                    ?: return UnionPayGpoResult.Error("Missing AIP")
+                    ?: return UnionPayContactGpoResult.Error("Missing AIP")
                 val aflTlv = TlvParser.findTag(firstTlv.value, EmvTags.AFL)
 
                 val aip = UnionPayAip(aipTlv.value)
@@ -167,9 +167,9 @@ class UnionPayKernel(
                     cardData[tlv.tag.hex] = tlv.value
                 }
 
-                UnionPayGpoResult.Success(aip, afl)
+                UnionPayContactGpoResult.Success(aip, afl)
             }
-            else -> UnionPayGpoResult.Error("Unknown GPO response format")
+            else -> UnionPayContactGpoResult.Error("Unknown GPO response format")
         }
     }
 
@@ -177,7 +177,7 @@ class UnionPayKernel(
      * Process qPBOC (Quick PBOC) transaction
      */
     private suspend fun processQpbocTransaction(
-        gpoData: UnionPayGpoResult.Success,
+        gpoData: UnionPayContactGpoResult.Success,
         transaction: UnionPayTransaction
     ): UnionPayKernelResult {
         // Read application data
@@ -204,7 +204,7 @@ class UnionPayKernel(
      * Process MSD transaction (legacy mode)
      */
     private suspend fun processMsdTransaction(
-        gpoData: UnionPayGpoResult.Success,
+        gpoData: UnionPayContactGpoResult.Success,
         transaction: UnionPayTransaction
     ): UnionPayKernelResult {
         // MSD mode - data already in GPO response
@@ -471,7 +471,7 @@ data class UnionPayTransaction(
     val type: Byte = 0x00
 )
 
-sealed class UnionPayGpoResult {
+sealed class UnionPayContactGpoResult {
     data class Success(val aip: UnionPayAip, val afl: ByteArray) : UnionPayGpoResult()
     data class Error(val message: String) : UnionPayGpoResult()
 }

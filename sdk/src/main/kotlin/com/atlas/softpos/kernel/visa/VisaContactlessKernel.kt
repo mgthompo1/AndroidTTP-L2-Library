@@ -13,6 +13,7 @@ import com.atlas.softpos.crypto.CaPublicKeyStore
 import com.atlas.softpos.crypto.OfflineDataAuthentication
 import com.atlas.softpos.crypto.OdaResult
 import com.atlas.softpos.crypto.OdaFailureReason
+import com.atlas.softpos.crypto.StandaloneOdaProcessor
 import com.atlas.softpos.kernel.common.*
 import com.atlas.softpos.security.SecureMemory
 import timber.log.Timber
@@ -364,9 +365,9 @@ class VisaContactlessKernel(
         val iccDynamicNumber = tlvMap["9F4C"]?.value
 
         // Store for later use
-        ctq?.let { cardData["9F6C"] = Tlv(EmvTags.CTQ, it) }
-        sdad?.let { cardData["9F4B"] = Tlv(EmvTags.SDAD, it) }
-        iccDynamicNumber?.let { cardData["9F4C"] = Tlv(EmvTags.ICC_DYNAMIC_NUMBER, it) }
+        ctq?.let { cardData["9F6C"] = Tlv.fromHex("9F6C", it.toHexString()) }
+        sdad?.let { cardData["9F4B"] = Tlv.fromHex("9F4B", it.toHexString()) }
+        iccDynamicNumber?.let { cardData["9F4C"] = Tlv.fromHex("9F4C", it.toHexString()) }
 
         return GpoResult.Success(
             aip = aip,
@@ -551,7 +552,7 @@ class VisaContactlessKernel(
         }
 
         // Create ODA processor
-        val oda = OfflineDataAuthentication(caKey, cardData.mapValues { it.value.value })
+        val oda = OfflineDataAuthentication(transceiver, cardData)
         val odaData = dataStore.get(TAG_ODA_DATA) ?: byteArrayOf()
 
         val result = oda.performOda(aip, odaData)
@@ -631,29 +632,27 @@ class VisaContactlessKernel(
             return OdaOutcome.Failed("Missing ICC Public Key Certificate")
         }
 
-        // Create ODA processor and perform fDDA verification
-        val oda = OfflineDataAuthentication(caKey, cardData.mapValues { it.value.value })
+        // Build static data to authenticate from AIP
+        val aip = cardData["82"]?.value ?: ByteArray(2)
+        val staticDataToAuthenticate = aip  // For fDDA, static data is typically the AIP
 
-        // Build fDDA input: terminal data that was signed
-        val amountAuthorized = dataStore.get(0x9F02) ?: ByteArray(6)
-        val amountOther = dataStore.get(0x9F03) ?: ByteArray(6)
-        val terminalCountryCode = dataStore.get(0x9F1A) ?: ByteArray(2)
-        val tvr = dataStore.get(0x95) ?: ByteArray(5)
-        val currencyCode = dataStore.get(0x5F2A) ?: ByteArray(2)
-        val transactionDate = dataStore.get(0x9A) ?: ByteArray(3)
-        val transactionType = dataStore.get(0x9C) ?: ByteArray(1)
+        // Perform fDDA using StandaloneOdaProcessor
+        val issuerPkCert = cardData["90"]?.value ?: run {
+            tvr.ddaFailed = true
+            return OdaOutcome.Failed("Missing Issuer Public Key Certificate")
+        }
+        val issuerPkExp = cardData["9F32"]?.value ?: byteArrayOf(0x03)
+        val iccPkExp = cardData["9F47"]?.value ?: byteArrayOf(0x03)
 
-        val fddaResult = oda.verifyFdda(
-            sdad = sdad,
-            iccDynamicNumber = iccDynamicNumber,
-            unpredictableNumber = un,
-            amountAuthorized = amountAuthorized,
-            amountOther = amountOther,
-            terminalCountryCode = terminalCountryCode,
-            tvr = tvr,
-            currencyCode = currencyCode,
-            transactionDate = transactionDate,
-            transactionType = transactionType
+        val fddaResult = StandaloneOdaProcessor.performFdda(
+            aid = selectedAid ?: ByteArray(0),
+            issuerPkCertificate = issuerPkCert,
+            issuerPkExponent = issuerPkExp,
+            iccPkCertificate = iccCert,
+            iccPkExponent = iccPkExp,
+            signedDynamicData = sdad,
+            staticDataToAuthenticate = staticDataToAuthenticate,
+            unpredictableNumber = un
         )
 
         return when (fddaResult) {

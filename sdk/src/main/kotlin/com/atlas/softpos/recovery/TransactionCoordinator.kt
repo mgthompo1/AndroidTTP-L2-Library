@@ -9,6 +9,7 @@ import com.atlas.softpos.cvm.CvmResult
 import com.atlas.softpos.cvm.OnlinePinEntry
 import com.atlas.softpos.cvm.OnlinePinResult
 import com.atlas.softpos.kernel.common.CardTransceiver
+import com.atlas.softpos.kernel.common.SelectedApplication
 import com.atlas.softpos.kernel.visa.VisaContactlessKernel
 import com.atlas.softpos.kernel.visa.VisaKernelConfiguration
 import com.atlas.softpos.kernel.visa.VisaKernelOutcome
@@ -16,7 +17,7 @@ import com.atlas.softpos.kernel.visa.VisaTransactionData
 import com.atlas.softpos.kernel.mastercard.MastercardContactlessKernel
 import com.atlas.softpos.kernel.mastercard.MastercardKernelConfiguration
 import com.atlas.softpos.kernel.mastercard.MastercardKernelOutcome
-import com.atlas.softpos.kernel.mastercard.MastercardTransactionData
+import com.atlas.softpos.kernel.mastercard.MastercardTransactionParams
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import timber.log.Timber
@@ -250,7 +251,7 @@ class TransactionCoordinator(
 
         val ppseResponse = transceiver.transceive(selectPpse)
         if (!ppseResponse.isSuccess) {
-            return KernelSelection.Failed("PPSE selection failed: ${ppseResponse.statusWord}")
+            return KernelSelection.Failed("PPSE selection failed: ${ppseResponse.sw.toString(16)}")
         }
 
         // Parse available AIDs
@@ -398,38 +399,46 @@ class TransactionCoordinator(
     ): TransactionOutcome {
         val kernel = MastercardContactlessKernel(transceiver, config.mastercardConfig)
 
-        val transactionData = MastercardTransactionData(
+        val transactionParams = MastercardTransactionParams(
             amount = amount,
             cashbackAmount = if (cashbackAmount > 0) cashbackAmount else null,
-            transactionType = transactionType
+            type = transactionType
+        )
+
+        // Create SelectedApplication from aid and pdol
+        val selectedApplication = SelectedApplication(
+            aid = aid,
+            label = "Mastercard",
+            pdol = pdol,
+            languagePreference = null,
+            fciData = byteArrayOf()
         )
 
         return errorRecovery.executeWithRecovery(
             operation = "Mastercard Transaction",
             retryPolicy = RetryPolicy(maxRetries = 1)
         ) {
-            val outcome = kernel.processTransaction(aid, pdol, transactionData)
+            val outcome = kernel.processTransaction(selectedApplication, transactionParams)
 
             when (outcome) {
                 is MastercardKernelOutcome.Approved -> TransactionOutcome.Approved(
-                    authData = outcome.authData.toMap(),
-                    cryptogram = outcome.authData.applicationCryptogram
+                    authData = outcome.authorizationData.toMap(),
+                    cryptogram = outcome.authorizationData.applicationCryptogram
                 )
                 is MastercardKernelOutcome.OnlineRequest -> {
-                    handleCvmIfRequired(outcome.authData.cvmResults, outcome.authData.pan, amount)
+                    handleCvmIfRequired(outcome.authorizationData.cvmResults, outcome.authorizationData.pan, amount)
 
                     TransactionOutcome.OnlineRequired(
-                        authData = outcome.authData.toMap(),
-                        cryptogram = outcome.authData.applicationCryptogram
+                        authData = outcome.authorizationData.toMap(),
+                        cryptogram = outcome.authorizationData.applicationCryptogram
                     )
                 }
                 is MastercardKernelOutcome.Declined -> TransactionOutcome.Declined(
                     reason = outcome.reason,
-                    authData = outcome.authData.toMap()
+                    authData = outcome.authorizationData?.toMap() ?: emptyMap()
                 )
                 is MastercardKernelOutcome.TryAnotherInterface -> TransactionOutcome.TryAnotherInterface
-                is MastercardKernelOutcome.EndApplication -> TransactionOutcome.Error(outcome.reason)
-                is MastercardKernelOutcome.TryAgain -> throw RetryableException(outcome.reason)
+                is MastercardKernelOutcome.EndApplication -> TransactionOutcome.Error(outcome.error.name)
             }
         }.let { result ->
             when (result) {
@@ -492,16 +501,21 @@ class TransactionCoordinator(
     private fun com.atlas.softpos.kernel.mastercard.MastercardAuthorizationData.toMap(): Map<String, String> {
         return mapOf(
             "pan" to pan,
-            "maskedPan" to maskedPan,
+            "maskedPan" to maskPan(pan),
             "track2" to track2Equivalent,
             "cryptogram" to applicationCryptogram,
-            "cid" to cryptogramInformationData,
+            "cid" to cryptogramInfoData.toString(16),
             "atc" to atc,
             "iad" to issuerApplicationData,
-            "tvr" to terminalVerificationResults,
+            "tvr" to tvr,
             "cvmResults" to cvmResults,
             "aid" to aid
         )
+    }
+
+    private fun maskPan(pan: String): String {
+        if (pan.length < 10) return pan
+        return pan.take(6) + "*".repeat(pan.length - 10) + pan.takeLast(4)
     }
 }
 
@@ -513,8 +527,8 @@ private class RecoveringTransceiver(
     private val errorRecovery: TransactionErrorRecovery
 ) : CardTransceiver {
 
-    override fun transceive(command: CommandApdu): ResponseApdu {
-        val commandBytes = command.toBytes()
+    override suspend fun transceive(command: CommandApdu): ResponseApdu {
+        val commandBytes = command.encode()
         val responseBytes = isoDep.transceive(commandBytes)
         return ResponseApdu.parse(responseBytes)
     }

@@ -192,7 +192,7 @@ class MastercardKernel(
                 if (firstTlv.value.size < 2) {
                     return MastercardGpoResult.Error("Invalid Format 1 response")
                 }
-                val aip = MastercardAip(firstTlv.value.copyOfRange(0, 2))
+                val aip = SimpleAip(firstTlv.value.copyOfRange(0, 2))
                 val afl = if (firstTlv.value.size > 2) {
                     firstTlv.value.copyOfRange(2, firstTlv.value.size)
                 } else {
@@ -208,7 +208,7 @@ class MastercardKernel(
                     ?: return MastercardGpoResult.Error("Missing AIP")
                 val aflTlv = TlvParser.findTag(firstTlv.value, EmvTags.AFL)
 
-                val aip = MastercardAip(aipTlv.value)
+                val aip = SimpleAip(aipTlv.value)
                 val afl = aflTlv?.value ?: ByteArray(0)
 
                 cardData[EmvTags.AIP.hex] = aip.bytes
@@ -355,7 +355,7 @@ class MastercardKernel(
     /**
      * Perform Offline Data Authentication
      */
-    private fun performOda(aip: MastercardAip) {
+    private fun performOda(aip: SimpleAip) {
         // Mastercard supports SDA, DDA, and CDA
         // For SoftPOS, typically use fDDA or CDA
 
@@ -387,7 +387,7 @@ class MastercardKernel(
     /**
      * Perform Cardholder Verification
      */
-    private fun performCvm(transaction: MastercardTransaction, aip: MastercardAip) {
+    private fun performCvm(transaction: MastercardTransaction, aip: SimpleAip) {
         // Check if CVM is required
         if (transaction.amount <= config.cvmRequiredLimit) {
             cvmPerformed = MastercardCvmType.NO_CVM_REQUIRED
@@ -686,7 +686,7 @@ class MastercardKernel(
 
 // Supporting classes
 
-data class MastercardAip(val bytes: ByteArray) {
+data class SimpleAip(val bytes: ByteArray) {
     fun isSdaSupported(): Boolean = (bytes[0].toInt() and 0x40) != 0
     fun isDdaSupported(): Boolean = (bytes[0].toInt() and 0x20) != 0
     fun isCdaSupported(): Boolean = (bytes[0].toInt() and 0x01) != 0
@@ -696,7 +696,7 @@ data class MastercardAip(val bytes: ByteArray) {
 
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
-        if (other !is MastercardAip) return false
+        if (other !is SimpleAip) return false
         return bytes.contentEquals(other.bytes)
     }
 
@@ -704,7 +704,7 @@ data class MastercardAip(val bytes: ByteArray) {
 }
 
 sealed class MastercardGpoResult {
-    data class Success(val aip: MastercardAip, val afl: ByteArray) : MastercardGpoResult()
+    data class Success(val aip: SimpleAip, val afl: ByteArray) : MastercardGpoResult()
     data class Error(val message: String) : MastercardGpoResult()
 }
 

@@ -41,10 +41,10 @@ class DiscoverKernel(
 
             // GET PROCESSING OPTIONS
             val gpoResult = performGpo(application.pdol, transaction)
-            if (gpoResult is DiscoverGpoResult.Error) {
+            if (gpoResult is DiscoverContactGpoResult.Error) {
                 return DiscoverKernelResult.Error(gpoResult.message)
             }
-            val gpoData = (gpoResult as DiscoverGpoResult.Success)
+            val gpoData = (gpoResult as DiscoverContactGpoResult.Success)
 
             // Read application data
             readApplicationData(gpoData.afl)
@@ -108,7 +108,7 @@ class DiscoverKernel(
         val response = transceiver.transceive(command)
 
         if (!response.isSuccess) {
-            return DiscoverGpoResult.Error("GPO failed: ${response.statusDescription}")
+            return DiscoverContactGpoResult.Error("GPO failed: ${response.statusDescription}")
         }
 
         return parseGpoResponse(response.data)
@@ -140,14 +140,14 @@ class DiscoverKernel(
 
     private fun parseGpoResponse(data: ByteArray): DiscoverGpoResult {
         val tlvList = TlvParser.parse(data)
-        if (tlvList.isEmpty()) return DiscoverGpoResult.Error("Empty GPO response")
+        if (tlvList.isEmpty()) return DiscoverContactGpoResult.Error("Empty GPO response")
 
         val firstTlv = tlvList[0]
 
         return when (firstTlv.tag.hex) {
             "80" -> {
                 if (firstTlv.value.size < 2) {
-                    return DiscoverGpoResult.Error("Invalid Format 1 response")
+                    return DiscoverContactGpoResult.Error("Invalid Format 1 response")
                 }
                 val aip = DiscoverAip(firstTlv.value.copyOfRange(0, 2))
                 val afl = if (firstTlv.value.size > 2) {
@@ -156,11 +156,11 @@ class DiscoverKernel(
 
                 cardData[EmvTags.AIP.hex] = aip.bytes
                 cardData[EmvTags.AFL.hex] = afl
-                DiscoverGpoResult.Success(aip, afl)
+                DiscoverContactGpoResult.Success(aip, afl)
             }
             "77" -> {
                 val aipTlv = TlvParser.findTag(firstTlv.value, EmvTags.AIP)
-                    ?: return DiscoverGpoResult.Error("Missing AIP")
+                    ?: return DiscoverContactGpoResult.Error("Missing AIP")
                 val aflTlv = TlvParser.findTag(firstTlv.value, EmvTags.AFL)
 
                 val aip = DiscoverAip(aipTlv.value)
@@ -173,9 +173,9 @@ class DiscoverKernel(
                     cardData[tlv.tag.hex] = tlv.value
                 }
 
-                DiscoverGpoResult.Success(aip, afl)
+                DiscoverContactGpoResult.Success(aip, afl)
             }
-            else -> DiscoverGpoResult.Error("Unknown GPO response format")
+            else -> DiscoverContactGpoResult.Error("Unknown GPO response format")
         }
     }
 
@@ -370,7 +370,7 @@ data class DiscoverTransaction(
     val type: Byte = 0x00
 )
 
-sealed class DiscoverGpoResult {
+sealed class DiscoverContactGpoResult {
     data class Success(val aip: DiscoverAip, val afl: ByteArray) : DiscoverGpoResult()
     data class Error(val message: String) : DiscoverGpoResult()
 }

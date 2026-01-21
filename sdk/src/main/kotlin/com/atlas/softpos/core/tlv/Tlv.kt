@@ -128,6 +128,11 @@ data class Tlv(
  * Parser for BER-TLV encoded data
  */
 object TlvParser {
+    /**
+     * Operator invoke to allow TlvParser() syntax for backward compatibility
+     * Returns the singleton object itself
+     */
+    operator fun invoke(): TlvParser = this
 
     /**
      * Parse a byte array containing one or more TLV objects
@@ -205,6 +210,13 @@ object TlvParser {
     fun findTag(data: ByteArray, tagHex: String): Tlv? {
         return findTag(data, TlvTag.fromHex(tagHex))
     }
+
+    /**
+     * Find a specific tag by EmvTags.Tag
+     */
+    fun findTag(data: ByteArray, tag: Tag): Tlv? {
+        return findTag(data, tag.hex)
+    }
 }
 
 /**
@@ -224,6 +236,10 @@ class TlvBuilder {
 
     fun add(tagHex: String, valueHex: String): TlvBuilder {
         return add(TlvTag.fromHex(tagHex), valueHex.hexToByteArray())
+    }
+
+    fun add(tag: Tag, value: ByteArray): TlvBuilder {
+        return add(TlvTag.fromHex(tag.hex), value)
     }
 
     fun add(tlv: Tlv): TlvBuilder {
@@ -260,3 +276,8 @@ class TlvBuilder {
 fun buildTlv(builder: TlvBuilder.() -> Unit): ByteArray {
     return TlvBuilder().apply(builder).build()
 }
+
+/**
+ * Type alias for backward compatibility - TlvObject is the same as Tlv
+ */
+typealias TlvObject = Tlv

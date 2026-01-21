@@ -219,6 +219,12 @@ data class ResponseApdu(
     }
 
     companion object {
+        /**
+         * Parse a byte array into a ResponseApdu.
+         * Alias for fromBytes for backward compatibility.
+         */
+        fun parse(bytes: ByteArray): ResponseApdu = fromBytes(bytes)
+
         fun fromBytes(bytes: ByteArray): ResponseApdu {
             require(bytes.size >= 2) { "Response must be at least 2 bytes (status word)" }
 

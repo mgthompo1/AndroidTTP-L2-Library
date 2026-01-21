@@ -266,13 +266,13 @@ class AmexContactlessKernel(
         val response = transceiver.transceive(command)
 
         if (!response.isSuccess) {
-            Timber.e("GPO failed: SW=${response.statusWord}")
+            Timber.e("GPO failed: SW=${response.sw.toString(16)}")
             return when {
                 response.sw1 == 0x69.toByte() && response.sw2 == 0x84.toByte() ->
                     AmexGpoResult.ReferenceDataNotFound
                 response.sw1 == 0x69.toByte() && response.sw2 == 0x85.toByte() ->
                     AmexGpoResult.ConditionsNotSatisfied
-                else -> AmexGpoResult.Error("GPO failed: ${response.statusWord}")
+                else -> AmexGpoResult.Error("GPO failed: ${response.sw.toString(16)}")
             }
         }
 
@@ -336,10 +336,10 @@ class AmexContactlessKernel(
         val atc = tlvMap["9F36"]?.value
 
         // Store GPO response data
-        ctq?.let { cardData["9F6C"] = Tlv.create("9F6C", it) }
-        track2?.let { cardData["57"] = Tlv.create("57", it) }
-        cryptogram?.let { cardData["9F26"] = Tlv.create("9F26", it) }
-        atc?.let { cardData["9F36"] = Tlv.create("9F36", it) }
+        ctq?.let { cardData["9F6C"] = Tlv.fromHex("9F6C", it.toHexString()) }
+        track2?.let { cardData["57"] = Tlv.fromHex("57", it.toHexString()) }
+        cryptogram?.let { cardData["9F26"] = Tlv.fromHex("9F26", it.toHexString()) }
+        atc?.let { cardData["9F36"] = Tlv.fromHex("9F36", it.toHexString()) }
 
         return AmexGpoResult.Success(
             aip = aip,
@@ -471,12 +471,14 @@ class AmexContactlessKernel(
             }
             is OdaResult.Failed -> {
                 when {
-                    result.reason.name.contains("SDA") -> tvr.sdaFailed = true
-                    result.reason.name.contains("DDA") -> tvr.ddaFailed = true
-                    result.reason.name.contains("CDA") -> tvr.cdaFailed = true
+                    result.failureReason.name.contains("SDA") -> tvr.sdaFailed = true
+                    result.failureReason.name.contains("DDA") -> tvr.ddaFailed = true
+                    result.failureReason.name.contains("CDA") -> tvr.cdaFailed = true
                 }
-                OdaOutcome.Failed(result.reason.name)
+                OdaOutcome.Failed(result.failureReason.name)
             }
+            is OdaResult.Success -> OdaOutcome.Success(result.type)
+            is OdaResult.Failure -> OdaOutcome.Failed(result.reason)
         }
     }
 
@@ -553,9 +555,9 @@ class AmexContactlessKernel(
             tvr.floorLimitExceeded = true
         }
 
-        // Contactless limit check
+        // Contactless limit check (using Upper Contactless Offline Limit)
         if (transaction.amount > config.contactlessTransactionLimit) {
-            tvr.exceedsContactlessLimit = true
+            tvr.ucolExceeded = true
         }
 
         // For SoftPOS, always force online
@@ -656,7 +658,7 @@ class AmexContactlessKernel(
         val response = transceiver.transceive(command)
 
         if (!response.isSuccess) {
-            return AmexKernelOutcome.EndApplication("GENERATE AC failed: ${response.statusWord}")
+            return AmexKernelOutcome.EndApplication("GENERATE AC failed: ${response.sw.toString(16)}")
         }
 
         // Parse response

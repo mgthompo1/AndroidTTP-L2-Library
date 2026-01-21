@@ -202,3 +202,8 @@ object MastercardTags {
     const val THIRD_PARTY_DATA = "9F6E"
     const val UDOL = "9F69"
 }
+
+/**
+ * Type alias for backward compatibility with TransactionCoordinator
+ */
+typealias MastercardKernelConfiguration = MastercardKernelConfig

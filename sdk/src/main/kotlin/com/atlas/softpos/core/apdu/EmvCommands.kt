@@ -77,7 +77,7 @@ object EmvCommands {
         }
 
         return CommandApdu(
-            cla = 0x80,  // Proprietary class
+            cla = 0x80.toByte(),  // Proprietary class
             ins = INS_GET_PROCESSING_OPTIONS,
             p1 = 0x00,
             p2 = 0x00,
@@ -128,7 +128,7 @@ object EmvCommands {
         }.let { if (cda) it or 0x10 else it }  // Set CDA bit if requested
 
         return CommandApdu(
-            cla = 0x80,
+            cla = 0x80.toByte(),
             ins = INS_GENERATE_AC,
             p1 = p1.toByte(),
             p2 = 0x00,
@@ -148,14 +148,14 @@ object EmvCommands {
         val tagBytes = tag.bytes
         return when (tagBytes.size) {
             1 -> CommandApdu(
-                cla = 0x80,
+                cla = 0x80.toByte(),
                 ins = INS_GET_DATA,
                 p1 = 0x00,
                 p2 = tagBytes[0],
                 le = 0
             )
             2 -> CommandApdu(
-                cla = 0x80,
+                cla = 0x80.toByte(),
                 ins = INS_GET_DATA,
                 p1 = tagBytes[0],
                 p2 = tagBytes[1],
@@ -192,7 +192,7 @@ object EmvCommands {
             cla = 0x00,
             ins = INS_VERIFY,
             p1 = 0x00,
-            p2 = 0x80,  // Plaintext PIN
+            p2 = 0x80.toByte(),  // Plaintext PIN
             data = pinBlock
         )
     }
@@ -206,7 +206,7 @@ object EmvCommands {
      */
     fun computeCryptographicChecksum(data: ByteArray): CommandApdu {
         return CommandApdu(
-            cla = 0x80,
+            cla = 0x80.toByte(),
             ins = INS_COMPUTE_CRYPTOGRAPHIC_CHECKSUM,
             p1 = 0x8E.toByte(),
             p2 = 0x80.toByte(),
@@ -224,7 +224,7 @@ object EmvCommands {
         terminalRelayResistanceData: ByteArray
     ): CommandApdu {
         return CommandApdu(
-            cla = 0x80,
+            cla = 0x80.toByte(),
             ins = INS_EXCHANGE_RELAY_RESISTANCE_DATA,
             p1 = 0x00,
             p2 = 0x00,

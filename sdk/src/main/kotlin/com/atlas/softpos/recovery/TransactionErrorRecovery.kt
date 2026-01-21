@@ -114,7 +114,7 @@ class TransactionErrorRecovery(
 
             // Successful with warning
             sw1 == 0x62 || sw1 == 0x63 -> {
-                Timber.w("$context: Warning SW=${response.statusWord}")
+                Timber.w("$context: Warning SW=${response.sw.toString(16)}")
                 CardResponseRecovery.SuccessWithWarning(parseWarning(sw1, sw2))
             }
 

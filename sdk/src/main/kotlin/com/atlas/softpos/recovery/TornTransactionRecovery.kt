@@ -138,7 +138,7 @@ class TornTransactionRecovery(
     suspend fun attemptRecovery(
         record: TornTransactionRecord,
         transceiver: CardTransceiver
-    ): RecoveryResult = mutex.withLock {
+    ): TornRecoveryResult = mutex.withLock {
         Timber.d("Attempting recovery for: ${record.recordId}")
 
         val updatedRecord = record.copy(
@@ -156,32 +156,32 @@ class TornTransactionRecovery(
                     // Card completed the transaction - we need to complete our side
                     Timber.i("Card reports transaction completed: ${record.recordId}")
                     markRecoveryComplete(record.recordId, cardStatus.cryptogram)
-                    RecoveryResult.CompletedOnCard(cardStatus.cryptogram)
+                    TornRecoveryResult.CompletedOnCard(cardStatus.cryptogram)
                 }
 
                 is CardTornStatus.TransactionNotFound -> {
                     // Card has no record - transaction was never completed
                     Timber.i("Card has no torn transaction record: ${record.recordId}")
                     markRecoveryComplete(record.recordId, null)
-                    RecoveryResult.NotFoundOnCard
+                    TornRecoveryResult.NotFoundOnCard
                 }
 
                 is CardTornStatus.TransactionAborted -> {
                     // Card aborted the transaction - we should do the same
                     Timber.i("Card reports transaction aborted: ${record.recordId}")
                     markRecoveryComplete(record.recordId, null)
-                    RecoveryResult.AbortedOnCard
+                    TornRecoveryResult.AbortedOnCard
                 }
 
                 is CardTornStatus.QueryFailed -> {
                     // Couldn't query card - keep trying
                     Timber.w("Failed to query card torn status: ${cardStatus.reason}")
-                    RecoveryResult.QueryFailed(cardStatus.reason)
+                    TornRecoveryResult.QueryFailed(cardStatus.reason)
                 }
             }
         } catch (e: Exception) {
             Timber.e(e, "Recovery exception for ${record.recordId}")
-            RecoveryResult.QueryFailed(e.message ?: "Unknown error")
+            TornRecoveryResult.QueryFailed(e.message ?: "Unknown error")
         }
     }
 
@@ -323,7 +323,7 @@ class TornTransactionRecovery(
                 val recordData = TlvParser.parseToMap(recordTlv.value)
 
                 entries.add(TornLogEntry(
-                    panLastFour = recordData["5A"]?.value?.takeLast(2)?.toHexString() ?: "",
+                    panLastFour = recordData["5A"]?.value?.toHexString()?.takeLast(4) ?: "",
                     amount = recordData["9F02"]?.value?.toLong() ?: 0,
                     completed = (recordData["DF8101"]?.value?.get(0)?.toInt() ?: 0) == 0x01,
                     cryptogram = recordData["9F26"]?.value
@@ -493,13 +493,13 @@ enum class TornRecordStatus {
 }
 
 /**
- * Recovery result
+ * Torn transaction recovery result
  */
-sealed class RecoveryResult {
-    data class CompletedOnCard(val cryptogram: ByteArray?) : RecoveryResult()
-    object NotFoundOnCard : RecoveryResult()
-    object AbortedOnCard : RecoveryResult()
-    data class QueryFailed(val reason: String) : RecoveryResult()
+sealed class TornRecoveryResult {
+    data class CompletedOnCard(val cryptogram: ByteArray?) : TornRecoveryResult()
+    object NotFoundOnCard : TornRecoveryResult()
+    object AbortedOnCard : TornRecoveryResult()
+    data class QueryFailed(val reason: String) : TornRecoveryResult()
 }
 
 /**

@@ -27,14 +27,18 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.atlas.softpos.kernel.visa.VisaContactlessKernel
-import com.atlas.softpos.kernel.visa.VisaTransactionParams
-import com.atlas.softpos.kernel.visa.VisaOutcomeType
+import com.atlas.softpos.kernel.visa.VisaKernelConfiguration
+import com.atlas.softpos.kernel.visa.VisaTransactionData
+import com.atlas.softpos.kernel.visa.VisaKernelOutcome
 import com.atlas.softpos.kernel.mastercard.MastercardContactlessKernel
+import com.atlas.softpos.kernel.mastercard.MastercardKernelConfig
 import com.atlas.softpos.kernel.mastercard.MastercardTransactionParams
-import com.atlas.softpos.kernel.mastercard.MastercardOutcomeType
+import com.atlas.softpos.kernel.mastercard.MastercardKernelOutcome
+import com.atlas.softpos.kernel.common.SelectedApplication
 import com.atlas.softpos.nfc.NfcCardReader
 import com.atlas.softpos.nfc.CardTransceiver
-import com.atlas.softpos.emv.EmvTags
+import com.atlas.softpos.core.apdu.CommandApdu
+import com.atlas.softpos.core.apdu.ResponseApdu
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -233,58 +237,64 @@ class MainActivity : ComponentActivity() {
     ) {
         log("Processing Visa transaction...", LogLevel.INFO)
 
-        val params = VisaTransactionParams(
-            amount = amountCents,
-            amountOther = 0,
-            transactionType = 0x00, // Purchase
-            currencyCode = 0x0840, // USD
-            countryCode = 0x0840, // USA
-            terminalType = 0x22,
+        val config = VisaKernelConfiguration(
+            terminalCountryCode = byteArrayOf(0x08, 0x40), // USA
+            transactionCurrencyCode = byteArrayOf(0x08, 0x40), // USD
             terminalCapabilities = byteArrayOf(0xE0.toByte(), 0xF0.toByte(), 0xC8.toByte()),
+            terminalType = 0x22,
             additionalTerminalCapabilities = byteArrayOf(
                 0x8F.toByte(), 0x00, 0xF0.toByte(), 0xF0.toByte(), 0x01
             ),
-            transactionDate = getCurrentDate(),
-            transactionTime = getCurrentTime(),
-            unpredictableNumber = generateUnpredictableNumber()
+            ifdSerialNumber = "SoftPOS001".toByteArray(),
+            merchantCategoryCode = byteArrayOf(0x54, 0x11), // Grocery
+            terminalFloorLimit = 0,
+            cvmRequiredLimit = 5000, // $50.00
+            contactlessTransactionLimit = 25000 // $250.00
         )
 
-        val kernel = VisaContactlessKernel(transceiver, params)
-        val outcome = kernel.processTransaction(aid)
+        val transactionData = VisaTransactionData(
+            amount = amountCents,
+            transactionType = 0x00 // Purchase
+        )
+
+        val kernel = VisaContactlessKernel(transceiver, config)
+        val outcome = kernel.processTransaction(aid, null, transactionData)
 
         withContext(Dispatchers.Main) {
-            when (outcome.type) {
-                VisaOutcomeType.APPROVED -> {
+            when (outcome) {
+                is VisaKernelOutcome.Approved -> {
                     transactionState.value = TransactionState.COMPLETE
                     outcomeMessage.value = "APPROVED (Offline)"
                     log("Transaction APPROVED offline", LogLevel.SUCCESS)
+                    log("Cryptogram: ${outcome.authData.applicationCryptogram}", LogLevel.INFO)
                 }
-                VisaOutcomeType.ONLINE_REQUEST -> {
+                is VisaKernelOutcome.OnlineRequest -> {
                     transactionState.value = TransactionState.COMPLETE
                     outcomeMessage.value = "ONLINE AUTHORIZATION REQUIRED"
                     log("Online authorization required", LogLevel.INFO)
-                    outcome.cryptogram?.let { log("ARQC: ${it.toHexString()}", LogLevel.INFO) }
+                    log("ARQC: ${outcome.authData.applicationCryptogram}", LogLevel.INFO)
                 }
-                VisaOutcomeType.DECLINED -> {
+                is VisaKernelOutcome.Declined -> {
                     transactionState.value = TransactionState.ERROR
                     outcomeMessage.value = "DECLINED"
-                    log("Transaction DECLINED", LogLevel.ERROR)
+                    log("Transaction DECLINED: ${outcome.reason}", LogLevel.ERROR)
                 }
-                VisaOutcomeType.TRY_ANOTHER_INTERFACE -> {
+                is VisaKernelOutcome.TryAnotherInterface -> {
                     transactionState.value = TransactionState.ERROR
                     outcomeMessage.value = "TRY ANOTHER INTERFACE"
                     log("Card requests another interface (insert/swipe)", LogLevel.WARNING)
                 }
-                VisaOutcomeType.END_APPLICATION -> {
+                is VisaKernelOutcome.EndApplication -> {
                     transactionState.value = TransactionState.ERROR
                     outcomeMessage.value = "APPLICATION ENDED"
-                    log("Application ended: ${outcome.errorMessage}", LogLevel.ERROR)
+                    log("Application ended: ${outcome.reason}", LogLevel.ERROR)
+                }
+                is VisaKernelOutcome.TryAgain -> {
+                    transactionState.value = TransactionState.ERROR
+                    outcomeMessage.value = "TRY AGAIN"
+                    log("Try again: ${outcome.reason}", LogLevel.WARNING)
                 }
             }
-
-            // Log additional outcome data
-            outcome.track2Data?.let { log("Track 2: ${it.toHexString()}", LogLevel.DEBUG) }
-            outcome.panHash?.let { log("PAN Hash: ${it.toHexString()}", LogLevel.DEBUG) }
         }
     }
 
@@ -295,83 +305,83 @@ class MainActivity : ComponentActivity() {
     ) {
         log("Processing Mastercard transaction...", LogLevel.INFO)
 
-        val params = MastercardTransactionParams(
+        val config = MastercardKernelConfig()  // Uses sensible defaults
+
+        val transactionParams = MastercardTransactionParams(
             amount = amountCents,
-            amountOther = 0,
-            transactionType = 0x00, // Purchase
-            currencyCode = 0x0840, // USD
-            countryCode = 0x0840, // USA
-            terminalType = 0x22,
-            terminalCapabilities = byteArrayOf(0xE0.toByte(), 0xF0.toByte(), 0xC8.toByte()),
-            additionalTerminalCapabilities = byteArrayOf(
-                0x8F.toByte(), 0x00, 0xF0.toByte(), 0xF0.toByte(), 0x01
-            ),
-            merchantCategoryCode = 0x5411, // Grocery stores
-            terminalCountryCode = 0x0840,
-            transactionDate = getCurrentDate(),
-            transactionTime = getCurrentTime(),
-            unpredictableNumber = generateUnpredictableNumber()
+            type = 0x00 // Purchase
         )
 
-        val kernel = MastercardContactlessKernel(transceiver, params)
-        val outcome = kernel.processTransaction(aid)
+        // Create SelectedApplication from the AID
+        val application = SelectedApplication(
+            aid = aid,
+            label = "Mastercard",
+            pdol = null,
+            languagePreference = null,
+            fciData = byteArrayOf()
+        )
+
+        val kernel = MastercardContactlessKernel(transceiver, config)
+        val outcome = kernel.processTransaction(application, transactionParams)
 
         withContext(Dispatchers.Main) {
-            when (outcome.type) {
-                MastercardOutcomeType.APPROVED -> {
+            when (outcome) {
+                is MastercardKernelOutcome.Approved -> {
                     transactionState.value = TransactionState.COMPLETE
                     outcomeMessage.value = "APPROVED (Offline)"
                     log("Transaction APPROVED offline", LogLevel.SUCCESS)
+                    log("Cryptogram: ${outcome.authorizationData.applicationCryptogram}", LogLevel.INFO)
                 }
-                MastercardOutcomeType.ONLINE_REQUEST -> {
+                is MastercardKernelOutcome.OnlineRequest -> {
                     transactionState.value = TransactionState.COMPLETE
                     outcomeMessage.value = "ONLINE AUTHORIZATION REQUIRED"
                     log("Online authorization required", LogLevel.INFO)
-                    outcome.cryptogram?.let { log("ARQC: ${it.toHexString()}", LogLevel.INFO) }
+                    log("ARQC: ${outcome.authorizationData.applicationCryptogram}", LogLevel.INFO)
                 }
-                MastercardOutcomeType.DECLINED -> {
+                is MastercardKernelOutcome.Declined -> {
                     transactionState.value = TransactionState.ERROR
                     outcomeMessage.value = "DECLINED"
-                    log("Transaction DECLINED", LogLevel.ERROR)
+                    log("Transaction DECLINED: ${outcome.reason}", LogLevel.ERROR)
                 }
-                MastercardOutcomeType.TRY_ANOTHER_INTERFACE -> {
+                is MastercardKernelOutcome.TryAnotherInterface -> {
                     transactionState.value = TransactionState.ERROR
                     outcomeMessage.value = "TRY ANOTHER INTERFACE"
-                    log("Card requests another interface", LogLevel.WARNING)
+                    log("Card requests another interface: ${outcome.reason}", LogLevel.WARNING)
                 }
-                MastercardOutcomeType.END_APPLICATION -> {
+                is MastercardKernelOutcome.EndApplication -> {
                     transactionState.value = TransactionState.ERROR
                     outcomeMessage.value = "APPLICATION ENDED"
-                    log("Application ended: ${outcome.errorMessage}", LogLevel.ERROR)
+                    log("Application ended: ${outcome.error.name}", LogLevel.ERROR)
                 }
             }
         }
     }
 
-    private fun selectPpse(transceiver: CardTransceiver): ByteArray? {
+    private suspend fun selectPpse(transceiver: CardTransceiver): ByteArray? {
         val ppseAid = "2PAY.SYS.DDF01".toByteArray(Charsets.US_ASCII)
         val selectCommand = buildSelectCommand(ppseAid)
 
         log("Selecting PPSE...", LogLevel.DEBUG)
         val response = transceiver.transceive(selectCommand)
 
-        return if (response.size >= 2 && response[response.size - 2] == 0x90.toByte() && response[response.size - 1] == 0x00.toByte()) {
+        return if (response.sw1 == 0x90.toByte() && response.sw2 == 0x00.toByte()) {
             log("PPSE selected successfully", LogLevel.DEBUG)
-            response
+            response.data
         } else {
-            log("PPSE selection failed: ${response.takeLast(2).toByteArray().toHexString()}", LogLevel.ERROR)
+            log("PPSE selection failed: SW=${response.sw.toString(16)}", LogLevel.ERROR)
             null
         }
     }
 
-    private fun buildSelectCommand(aid: ByteArray): ByteArray {
-        return byteArrayOf(
-            0x00, // CLA
-            0xA4.toByte(), // INS: SELECT
-            0x04, // P1: Select by name
-            0x00, // P2: First occurrence
-            aid.size.toByte()
-        ) + aid + byteArrayOf(0x00) // Le
+    private fun buildSelectCommand(aid: ByteArray): CommandApdu {
+        return CommandApdu(
+            cla = 0x00,
+            ins = 0xA4.toByte(),
+            p1 = 0x04,
+            p2 = 0x00,
+            data = aid,
+            le = 0
+        )
     }
 
     private fun parsePpseResponse(response: ByteArray): List<ByteArray> {
@@ -580,12 +590,13 @@ class MainActivity : ComponentActivity() {
         private val logger: (String, String) -> Unit
     ) : CardTransceiver {
 
-        override fun transceive(command: ByteArray): ByteArray {
-            val cmdHex = command.joinToString("") { "%02X".format(it) }
-            val response = isoDep.transceive(command)
+        override suspend fun transceive(command: CommandApdu): ResponseApdu {
+            val commandBytes = command.encode()
+            val cmdHex = commandBytes.joinToString("") { "%02X".format(it) }
+            val response = isoDep.transceive(commandBytes)
             val respHex = response.joinToString("") { "%02X".format(it) }
             logger(cmdHex, respHex)
-            return response
+            return ResponseApdu.parse(response)
         }
     }
 }

@@ -700,7 +700,7 @@ class CardRemovalDetector(
     @Suppress("unused")
     private val checkIntervalMs: Long = 50
 ) {
-    private val cardPresent = AtomicReference(true)
+    private val cardPresent = AtomicBoolean(true)
     private val checkCount = AtomicInteger(0)
 
     /**

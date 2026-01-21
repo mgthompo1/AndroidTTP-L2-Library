@@ -118,7 +118,7 @@ object CaPublicKeyStore {
         // Visa Test Key
         addKey(CaPublicKey(
             rid = "A000000003".hexToByteArray(),
-            index = 0x92,
+            index = 0x92.toByte(),
             modulus = ("996AF56F569187D09293C14810450ED8EE3357397B18A2458EFAA92DA3B6DF65" +
                     "14EC060195318FD43BE9B8F0CC669E3F844057CBDDF8BDA191BB64473BC8DC9A" +
                     "730DB8F6B4EDE3924186FFD9E1C6D3E0D8FFE90D81BB65EAA27E34CE89BD2EE9" +
@@ -166,7 +166,7 @@ object CaPublicKeyStore {
 
         addKey(CaPublicKey(
             rid = "A000000004".hexToByteArray(),
-            index = 0xEF,
+            index = 0xEF.toByte(),
             modulus = ("A191CB87473F29349B5D60A88B3EAEE0973AA6F1A082F358D849FDDFF9C091F8" +
                     "99EDA9792CAF09EF28F5D22404B88A2293EEBBC1949C43BEA4D60CFD879A1539" +
                     "544E09E0F09F60F065B2BF2A13ECC705F3D468B9D33AE77AD9D3F19CA40F23DC" +
@@ -181,7 +181,7 @@ object CaPublicKeyStore {
 
         addKey(CaPublicKey(
             rid = "A000000004".hexToByteArray(),
-            index = 0xFA,
+            index = 0xFA.toByte(),
             modulus = ("A90FCD55AA2D5D9963E35ED0F440177699832F49C6BAB15CDAE5794BE93F934D" +
                     "4462D5D12762E48C38BA83D8445DEAA74195A301A102B2F114EADA0D180EE5E7" +
                     "A5C73E0C4E11F67A43DDAB5D55683B1474CC0627F44B8D3088A492FFAADAD4F4" +
@@ -224,7 +224,7 @@ object CaPublicKeyStore {
 
         addKey(CaPublicKey(
             rid = "A000000025".hexToByteArray(),
-            index = 0xC9,
+            index = 0xC9.toByte(),
             modulus = ("B0627DEE87864F9C18C13B9A1F025448BF13C58380C91F4CEBA9F9BCB214FF8414" +
                     "E9B59D6ABA10F941C7331768F47B2127907D857FA39AAF8CE02045DD01619D689E" +
                     "E731C551159BE7EB2D51A372FF56B556E5CB2FDE36E23073A44CA215D6C26CA68847" +

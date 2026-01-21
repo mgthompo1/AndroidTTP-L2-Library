@@ -39,10 +39,10 @@ class AmexKernel(
 
             // GET PROCESSING OPTIONS
             val gpoResult = performGpo(application.pdol, transaction)
-            if (gpoResult is AmexGpoResult.Error) {
+            if (gpoResult is AmexContactGpoResult.Error) {
                 return AmexKernelResult.Error(gpoResult.message)
             }
-            val gpoData = (gpoResult as AmexGpoResult.Success)
+            val gpoData = (gpoResult as AmexContactGpoResult.Success)
 
             // Determine path based on AIP
             val isEmvMode = gpoData.aip.isEmvModeSupported()
@@ -96,7 +96,7 @@ class AmexKernel(
         val response = transceiver.transceive(command)
 
         if (!response.isSuccess) {
-            return AmexGpoResult.Error("GPO failed: ${response.statusDescription}")
+            return AmexContactGpoResult.Error("GPO failed: ${response.statusDescription}")
         }
 
         return parseGpoResponse(response.data)
@@ -128,14 +128,14 @@ class AmexKernel(
 
     private fun parseGpoResponse(data: ByteArray): AmexGpoResult {
         val tlvList = TlvParser.parse(data)
-        if (tlvList.isEmpty()) return AmexGpoResult.Error("Empty GPO response")
+        if (tlvList.isEmpty()) return AmexContactGpoResult.Error("Empty GPO response")
 
         val firstTlv = tlvList[0]
 
         return when (firstTlv.tag.hex) {
             "80" -> {
                 if (firstTlv.value.size < 2) {
-                    return AmexGpoResult.Error("Invalid Format 1 response")
+                    return AmexContactGpoResult.Error("Invalid Format 1 response")
                 }
                 val aip = AmexAip(firstTlv.value.copyOfRange(0, 2))
                 val afl = if (firstTlv.value.size > 2) {
@@ -144,11 +144,11 @@ class AmexKernel(
 
                 cardData[EmvTags.AIP.hex] = aip.bytes
                 cardData[EmvTags.AFL.hex] = afl
-                AmexGpoResult.Success(aip, afl)
+                AmexContactGpoResult.Success(aip, afl)
             }
             "77" -> {
                 val aipTlv = TlvParser.findTag(firstTlv.value, EmvTags.AIP)
-                    ?: return AmexGpoResult.Error("Missing AIP")
+                    ?: return AmexContactGpoResult.Error("Missing AIP")
                 val aflTlv = TlvParser.findTag(firstTlv.value, EmvTags.AFL)
 
                 val aip = AmexAip(aipTlv.value)
@@ -161,14 +161,14 @@ class AmexKernel(
                     cardData[tlv.tag.hex] = tlv.value
                 }
 
-                AmexGpoResult.Success(aip, afl)
+                AmexContactGpoResult.Success(aip, afl)
             }
-            else -> AmexGpoResult.Error("Unknown GPO response format")
+            else -> AmexContactGpoResult.Error("Unknown GPO response format")
         }
     }
 
     private suspend fun processEmvTransaction(
-        gpoData: AmexGpoResult.Success,
+        gpoData: AmexContactGpoResult.Success,
         transaction: AmexTransaction
     ): AmexKernelResult {
         // Read application data
@@ -189,7 +189,7 @@ class AmexKernel(
     }
 
     private suspend fun processMagStripeTransaction(
-        gpoData: AmexGpoResult.Success,
+        gpoData: AmexContactGpoResult.Success,
         transaction: AmexTransaction
     ): AmexKernelResult {
         // Mag stripe mode - cryptogram from GPO response
@@ -422,7 +422,7 @@ data class AmexTransaction(
     val type: Byte = 0x00
 )
 
-sealed class AmexGpoResult {
+sealed class AmexContactGpoResult {
     data class Success(val aip: AmexAip, val afl: ByteArray) : AmexGpoResult()
     data class Error(val message: String) : AmexGpoResult()
 }

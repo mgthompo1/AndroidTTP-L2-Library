@@ -6,7 +6,7 @@ import com.atlas.softpos.kernel.common.*
 import com.atlas.softpos.kernel.visa.VisaContactlessKernel
 import com.atlas.softpos.kernel.visa.VisaKernelConfig
 import com.atlas.softpos.kernel.visa.VisaKernelOutcome
-import com.atlas.softpos.kernel.visa.VisaTransactionParams
+import com.atlas.softpos.kernel.visa.VisaTransactionData
 import com.atlas.softpos.kernel.mastercard.MastercardContactlessKernel
 import com.atlas.softpos.kernel.mastercard.MastercardKernelConfig
 import com.atlas.softpos.kernel.mastercard.MastercardKernelOutcome
@@ -30,6 +30,8 @@ import com.atlas.softpos.kernel.unionpay.UnionPayTransaction
 import com.atlas.softpos.nfc.NfcCardReader
 import com.atlas.softpos.nfc.NfcStatus
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import timber.log.Timber
 
@@ -275,7 +277,7 @@ class AtlasSoftPos private constructor(
         cashbackAmount: Long?,
         callback: TransactionCallback
     ) {
-        kotlinx.coroutines.GlobalScope.launch(Dispatchers.Main) {
+        GlobalScope.launch(Dispatchers.Main) {
             try {
                 val result = withContext(Dispatchers.IO) {
                     processTransaction(tag, amount, type, cashbackAmount)
@@ -377,20 +379,21 @@ class AtlasSoftPos private constructor(
         type: TransactionType,
         cashbackAmount: Long?
     ): TransactionResult {
-        val kernel = VisaContactlessKernel(transceiver, visaConfig)
-        val transaction = VisaTransactionParams(amount, cashbackAmount, type.code)
+        val kernel = VisaContactlessKernel(transceiver, visaConfig.toKernelConfiguration())
+        val transaction = VisaTransactionData(amount, cashbackAmount, type.code)
 
-        return when (val result = kernel.processTransaction(application, transaction)) {
+        return when (val result = kernel.processTransaction(application.aid, application.pdol, transaction)) {
             is VisaKernelOutcome.OnlineRequest -> {
                 TransactionResult.OnlineRequired(
                     cardNetwork = CardNetwork.VISA,
-                    authorizationData = AuthorizationData.fromVisaNew(result.authorizationData)
+                    authorizationData = AuthorizationData.fromVisaNew(result.authData)
                 )
             }
             is VisaKernelOutcome.Approved -> TransactionResult.Approved(CardNetwork.VISA)
             is VisaKernelOutcome.Declined -> TransactionResult.Declined(CardNetwork.VISA, result.reason)
-            is VisaKernelOutcome.TryAnotherInterface -> TransactionResult.Error("Try another interface: ${result.reason}")
-            is VisaKernelOutcome.EndApplication -> TransactionResult.Error("Error: ${result.error}")
+            is VisaKernelOutcome.TryAnotherInterface -> TransactionResult.Error("Try another interface")
+            is VisaKernelOutcome.EndApplication -> TransactionResult.Error("Error: ${result.reason}")
+            is VisaKernelOutcome.TryAgain -> TransactionResult.Error("Try again: ${result.reason}")
         }
     }
 
@@ -680,18 +683,18 @@ data class AuthorizationData(
             track2Equivalent = req.track2Equivalent,
             panSequenceNumber = req.panSequenceNumber,
             applicationCryptogram = req.applicationCryptogram,
-            cryptogramType = req.cryptogramType.name,
+            cryptogramType = req.cryptogramInformationData,
             atc = req.atc,
             issuerApplicationData = req.issuerApplicationData,
-            terminalVerificationResults = req.tvr,
+            terminalVerificationResults = req.terminalVerificationResults,
             cvmResults = req.cvmResults,
             amountAuthorized = req.amountAuthorized,
             transactionDate = req.transactionDate,
             transactionType = req.transactionType,
             unpredictableNumber = req.unpredictableNumber,
-            aip = req.aip,
+            aip = req.applicationInterchangeProfile,
             aid = req.aid,
-            cardholderName = req.cardholderName ?: "",
+            cardholderName = req.cardholderName,
             rawData = ""
         )
 
@@ -886,9 +889,3 @@ sealed class TransactionError {
     data class NfcError(val message: String) : TransactionError()
     data class ProcessingError(val message: String) : TransactionError()
 }
-
-// Coroutine helper
-private fun kotlinx.coroutines.GlobalScope.launch(
-    context: kotlinx.coroutines.CoroutineContext,
-    block: suspend kotlinx.coroutines.CoroutineScope.() -> Unit
-) = kotlinx.coroutines.GlobalScope.launch(context) { block() }
