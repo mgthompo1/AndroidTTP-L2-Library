@@ -148,8 +148,16 @@ object TlvParser {
             offset += tagLength
 
             // Parse length
+            if (offset >= data.size) break
             val (length, lengthBytes) = Tlv.parseLength(data, offset)
             offset += lengthBytes
+
+            // Bounds check before extracting value
+            if (offset + length > data.size) {
+                throw IllegalArgumentException(
+                    "TLV length exceeds data bounds: offset=$offset, length=$length, dataSize=${data.size}"
+                )
+            }
 
             // Extract value
             val value = data.copyOfRange(offset, offset + length)
@@ -239,6 +247,7 @@ class TlvBuilder {
     }
 
     fun build(): ByteArray {
+        if (tlvs.isEmpty()) return byteArrayOf()
         return tlvs.map { it.encode() }.reduce { acc, bytes -> acc + bytes }
     }
 

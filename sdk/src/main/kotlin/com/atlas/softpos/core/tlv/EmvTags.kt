@@ -325,7 +325,7 @@ object EmvTags {
     /** Card Transaction Qualifiers (CTQ) - Card */
     val CTQ = Tag(0x9F6C, "Card Transaction Qualifiers", Source.CARD, Format.BINARY, 2, 2)
 
-    /** Form Factor Indicator - Card */
+    /** Form Factor Indicator - Card (Visa) - Note: 0x9F6E also used by Mastercard as Third Party Data */
     val FFI = Tag(0x9F6E, "Form Factor Indicator", Source.CARD, Format.BINARY, 4, 4)
 
     /** Customer Exclusive Data - Card */
@@ -342,7 +342,7 @@ object EmvTags {
     /** Contactless Reader Capabilities - Terminal */
     val CL_READER_CAPS = Tag(0x9F6D, "CL Reader Capabilities", Source.TERMINAL, Format.BINARY, 1, 1)
 
-    /** Third Party Data - Card */
+    /** Third Party Data - Card (Mastercard) - Note: Same tag 0x9F6E as Visa FFI, interpretation depends on kernel */
     val THIRD_PARTY_DATA = Tag(0x9F6E, "Third Party Data", Source.CARD, Format.BINARY, 0, 32)
 
     /** DS Summary 1 - Card */
@@ -391,11 +391,11 @@ object EmvTags {
     /** FCI Proprietary Template */
     val FCI_PROPRIETARY = Tag(0xA5, "FCI Proprietary Template", Source.CARD, Format.CONSTRUCTED, 0, 255)
 
-    /** Application Template */
+    /** Application Template / Directory Entry (same tag) */
     val APP_TEMPLATE = Tag(0x61, "Application Template", Source.CARD, Format.CONSTRUCTED, 0, 255)
 
-    /** Directory Entry */
-    val DIRECTORY_ENTRY = Tag(0x61, "Directory Entry", Source.CARD, Format.CONSTRUCTED, 0, 255)
+    /** Alias for APP_TEMPLATE - Directory Entry uses same tag 0x61 */
+    val DIRECTORY_ENTRY = APP_TEMPLATE
 
     /** Record Template */
     val RECORD_TEMPLATE = Tag(0x70, "Record Template", Source.CARD, Format.CONSTRUCTED, 0, 255)
@@ -409,6 +409,7 @@ object EmvTags {
     // ==================== LOOKUP ====================
 
     private val allTags: Map<Int, Tag> = mapOf(
+        // Primitive tags
         0x4F to AID,
         0x50 to APPLICATION_LABEL,
         0x57 to TRACK2_EQUIVALENT,
@@ -422,39 +423,72 @@ object EmvTags {
         0x5F30 to SERVICE_CODE,
         0x5F34 to PAN_SEQUENCE_NUMBER,
         0x5F36 to TRANSACTION_CURRENCY_EXPONENT,
+
+        // EMV tags (8X, 9X)
         0x82 to AIP,
+        0x83 to COMMAND_TEMPLATE,
         0x84 to DF_NAME,
+        0x86 to ISSUER_SCRIPT_COMMAND,
         0x87 to APP_PRIORITY_INDICATOR,
         0x88 to SFI,
+        0x89 to AUTHORIZATION_CODE,
+        0x8A to AUTHORIZATION_RESPONSE_CODE,
         0x8C to CDOL1,
         0x8D to CDOL2,
         0x8E to CVM_LIST,
         0x8F to CA_PUBLIC_KEY_INDEX,
         0x90 to ISSUER_PK_CERTIFICATE,
+        0x91 to ISSUER_AUTH_DATA,
         0x92 to ISSUER_PK_REMAINDER,
         0x93 to SSAD,
         0x94 to AFL,
         0x95 to TVR,
+        0x97 to TDOL,
+        0x98 to TC_HASH,
+        0x99 to TXN_PIN_DATA,
         0x9A to TRANSACTION_DATE,
         0x9B to TSI,
         0x9C to TRANSACTION_TYPE,
+        0x9D to DDF_NAME,
+
+        // EMV tags (9FXXX)
         0x9F01 to ACQUIRER_ID,
         0x9F02 to AMOUNT_AUTHORIZED,
         0x9F03 to AMOUNT_OTHER,
+        0x9F04 to AMOUNT_AUTHORIZED_BINARY,
+        0x9F05 to APP_DISCRETIONARY_DATA,
         0x9F06 to AID_TERMINAL,
         0x9F07 to AUC,
         0x9F08 to APP_VERSION_CARD,
         0x9F09 to APP_VERSION_TERMINAL,
+        0x9F0B to CARDHOLDER_NAME_EXTENDED,
         0x9F0D to IAC_DEFAULT,
         0x9F0E to IAC_DENIAL,
         0x9F0F to IAC_ONLINE,
         0x9F10 to IAD,
+        0x9F11 to ISSUER_CODE_TABLE_INDEX,
+        0x9F12 to APP_PREFERRED_NAME,
+        0x9F13 to LAST_ONLINE_ATC,
+        0x9F14 to LCOL,
+        0x9F15 to MCC,
+        0x9F16 to MERCHANT_ID,
+        0x9F17 to PIN_TRY_COUNTER,
+        0x9F18 to ISSUER_SCRIPT_ID,
         0x9F1A to TERMINAL_COUNTRY_CODE,
         0x9F1B to TERMINAL_FLOOR_LIMIT,
+        0x9F1C to TERMINAL_ID,
+        0x9F1D to TRM_DATA,
         0x9F1E to IFD_SERIAL_NUMBER,
+        0x9F1F to TRACK1_DISCRETIONARY,
+        0x9F20 to TRACK2_DISCRETIONARY,
         0x9F21 to TRANSACTION_TIME,
+        0x9F23 to UCOL,
         0x9F26 to APPLICATION_CRYPTOGRAM,
         0x9F27 to CID,
+        0x9F2A to KERNEL_ID,
+        0x9F2D to ICC_PIN_PK_CERT,
+        0x9F2E to ICC_PIN_PK_EXP,
+        0x9F2F to ICC_PIN_PK_REM,
         0x9F32 to ISSUER_PK_EXPONENT,
         0x9F33 to TERMINAL_CAPABILITIES,
         0x9F34 to CVM_RESULTS,
@@ -462,8 +496,17 @@ object EmvTags {
         0x9F36 to ATC,
         0x9F37 to UNPREDICTABLE_NUMBER,
         0x9F38 to PDOL,
+        0x9F39 to POS_ENTRY_MODE,
+        0x9F3A to AMOUNT_REF_CURRENCY,
+        0x9F3B to APP_REF_CURRENCY,
+        0x9F3C to TXN_REF_CURRENCY_CODE,
+        0x9F3D to TXN_REF_CURRENCY_EXP,
         0x9F40 to ADDITIONAL_TERMINAL_CAPS,
         0x9F41 to TRANSACTION_SEQ_COUNTER,
+        0x9F42 to APP_CURRENCY_CODE,
+        0x9F43 to APP_CURRENCY_EXPONENT,
+        0x9F44 to APP_CURRENCY_EXP,
+        0x9F45 to DAC,
         0x9F46 to ICC_PK_CERTIFICATE,
         0x9F47 to ICC_PK_EXPONENT,
         0x9F48 to ICC_PK_REMAINDER,
@@ -471,8 +514,36 @@ object EmvTags {
         0x9F4A to SDA_TAG_LIST,
         0x9F4B to SDAD,
         0x9F4C to ICC_DYNAMIC_NUMBER,
+        0x9F4D to LOG_ENTRY,
+        0x9F4E to MERCHANT_NAME_LOCATION,
+        0x9F50 to OFFLINE_ACCUM_BALANCE,
         0x9F66 to TTQ,
-        0x9F6C to CTQ
+        0x9F69 to CARD_AUTH_RELATED_DATA,
+        0x9F6C to CTQ,
+        0x9F6D to CL_READER_CAPS,
+        0x9F6E to FFI,  // Note: Mastercard uses this as THIRD_PARTY_DATA
+        0x9F7C to CUSTOMER_EXCLUSIVE_DATA,
+        0x9F7D to DS_SUMMARY_1,
+
+        // Template tags
+        0x61 to APP_TEMPLATE,
+        0x6F to FCI_TEMPLATE,
+        0x70 to RECORD_TEMPLATE,
+        0x71 to ISSUER_SCRIPT_1,
+        0x72 to ISSUER_SCRIPT_2,
+        0x77 to RESPONSE_FORMAT_2,
+        0x80 to RESPONSE_FORMAT_1,
+        0xA5 to FCI_PROPRIETARY,
+
+        // Kernel database tags (DFXXX)
+        0xDF8101 to KERNEL_CONFIG,
+        0xDF8123 to CL_FLOOR_LIMIT,
+        0xDF8124 to CL_TXN_LIMIT_ODCVM,
+        0xDF8125 to CL_TXN_LIMIT_NO_ODCVM,
+        0xDF8126 to CVM_REQUIRED_LIMIT,
+        0xDF8128 to TORN_TXN_LOG,
+        0xDF8129 to OUTCOME_PARAMETER_SET,
+        0xDF8130 to HOLD_TIME
     )
 
     fun get(tagValue: Int): Tag? = allTags[tagValue]
@@ -481,6 +552,15 @@ object EmvTags {
         val value = tagHex.toIntOrNull(16) ?: return null
         return allTags[value]
     }
+
+    /** Get all defined tags */
+    fun all(): Collection<Tag> = allTags.values
+
+    /** Check if a tag value is known */
+    fun isKnown(tagValue: Int): Boolean = allTags.containsKey(tagValue)
+
+    /** Check if a tag hex is known */
+    fun isKnown(tagHex: String): Boolean = get(tagHex) != null
 }
 
 /**
@@ -494,12 +574,32 @@ data class Tag(
     val minLength: Int,
     val maxLength: Int
 ) {
-    val hex: String get() = "%02X".format(value)
-    val bytes: ByteArray get() = if (value > 0xFF) {
-        byteArrayOf((value shr 8).toByte(), (value and 0xFF).toByte())
-    } else {
-        byteArrayOf(value.toByte())
+    /** Tag value as hex string (e.g., "9F66", "DF8101") */
+    val hex: String get() = when {
+        value > 0xFFFF -> "%06X".format(value)
+        value > 0xFF -> "%04X".format(value)
+        else -> "%02X".format(value)
     }
+
+    /** Tag value as byte array for encoding */
+    val bytes: ByteArray get() = when {
+        value > 0xFFFF -> byteArrayOf(
+            (value shr 16).toByte(),
+            (value shr 8).toByte(),
+            (value and 0xFF).toByte()
+        )
+        value > 0xFF -> byteArrayOf(
+            (value shr 8).toByte(),
+            (value and 0xFF).toByte()
+        )
+        else -> byteArrayOf(value.toByte())
+    }
+
+    /** Check if data length is valid for this tag */
+    fun isValidLength(length: Int): Boolean = length in minLength..maxLength
+
+    /** Check if data is valid for this tag */
+    fun isValidData(data: ByteArray): Boolean = isValidLength(data.size)
 }
 
 enum class Source {

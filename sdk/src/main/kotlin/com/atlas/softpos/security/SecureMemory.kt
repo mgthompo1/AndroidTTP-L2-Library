@@ -92,16 +92,20 @@ object SecureMemory {
      * Constant-time byte array comparison
      *
      * Prevents timing attacks by ensuring comparison takes the same
-     * amount of time regardless of where differences occur
+     * amount of time regardless of where differences occur or if sizes differ
      */
     fun constantTimeEquals(a: ByteArray?, b: ByteArray?): Boolean {
         if (a == null && b == null) return true
         if (a == null || b == null) return false
-        if (a.size != b.size) return false
 
-        var result = 0
-        for (i in a.indices) {
-            result = result or (a[i].toInt() xor b[i].toInt())
+        // Use max length to prevent timing leak on size difference
+        val maxLen = maxOf(a.size, b.size)
+        var result = a.size xor b.size  // Will be non-zero if sizes differ
+
+        for (i in 0 until maxLen) {
+            val aVal = if (i < a.size) a[i].toInt() else 0
+            val bVal = if (i < b.size) b[i].toInt() else 0
+            result = result or (aVal xor bVal)
         }
         return result == 0
     }
@@ -249,6 +253,9 @@ class SensitiveByteArray private constructor(
         return "SensitiveByteArray[size=${size}, cleared=${isCleared()}]"
     }
 
+    // Note: finalize() is deprecated in Java 9+, but we keep it as a safety net
+    // The preferred cleanup is via close() or use() blocks
+    @Suppress("removal", "DEPRECATION")
     protected fun finalize() {
         // Safety net - clear if not already cleared
         clear()
@@ -332,6 +339,8 @@ class SensitiveCharArray private constructor(
         return "SensitiveCharArray[size=${size}, cleared=${isCleared()}]"
     }
 
+    // Note: finalize() is deprecated in Java 9+, but we keep it as a safety net
+    @Suppress("removal", "DEPRECATION")
     protected fun finalize() {
         clear()
     }

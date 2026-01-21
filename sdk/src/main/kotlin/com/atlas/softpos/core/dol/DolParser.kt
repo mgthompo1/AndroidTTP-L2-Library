@@ -81,7 +81,7 @@ object DolParser {
 
         for (entry in entries) {
             val value = dataStore.get(entry.tagValue) ?: dataStore.get(entry.tagHex)
-            val data = formatValue(value, entry.length)
+            val data = formatValue(value, entry.length, entry.tagValue)
             result.addAll(data.toList())
 
             Timber.v("DOL entry ${entry.tagHex}: requested=${entry.length}, provided=${data.size}, value=${data.toHexString()}")
@@ -92,25 +92,53 @@ object DolParser {
 
     /**
      * Format a value to the required length
-     * - If value is null, return zeros
-     * - If value is shorter, left-pad with zeros (for numeric) or right-pad (for alpha)
+     * - If value is null, return zeros (or spaces for alphanumeric)
+     * - If value is shorter, left-pad with zeros (for numeric) or right-pad with spaces (for alpha)
      * - If value is longer, truncate
      */
-    private fun formatValue(value: ByteArray?, requestedLength: Int): ByteArray {
+    private fun formatValue(value: ByteArray?, requestedLength: Int, tagValue: Int = 0): ByteArray {
+        val isAlphanumeric = isAlphanumericTag(tagValue)
+
         if (value == null) {
-            return ByteArray(requestedLength)
+            return if (isAlphanumeric) {
+                ByteArray(requestedLength) { 0x20 }  // Space padding for AN fields
+            } else {
+                ByteArray(requestedLength)  // Zero padding for numeric fields
+            }
         }
 
         return when {
             value.size == requestedLength -> value
             value.size > requestedLength -> value.copyOfRange(0, requestedLength)
             else -> {
-                // Pad - left pad for numeric tags, right pad for others
                 val padded = ByteArray(requestedLength)
-                System.arraycopy(value, 0, padded, requestedLength - value.size, value.size)
+                if (isAlphanumeric) {
+                    // Right-pad with spaces for alphanumeric fields
+                    padded.fill(0x20)  // Fill with spaces
+                    System.arraycopy(value, 0, padded, 0, value.size)
+                } else {
+                    // Left-pad with zeros for numeric fields
+                    System.arraycopy(value, 0, padded, requestedLength - value.size, value.size)
+                }
                 padded
             }
         }
+    }
+
+    /**
+     * Check if tag is alphanumeric (AN/ANS format) - these need right-padding with spaces
+     */
+    private fun isAlphanumericTag(tagValue: Int): Boolean {
+        return tagValue in listOf(
+            0x9F1C,  // Terminal Identification (8 bytes AN)
+            0x9F16,  // Merchant Identifier (15 bytes AN)
+            0x9F1E,  // IFD Serial Number (8 bytes AN)
+            0x5F20,  // Cardholder Name (2-26 bytes ANS)
+            0x50,    // Application Label (1-16 bytes ANS)
+            0x9F12,  // Application Preferred Name (1-16 bytes ANS)
+            0x5F2D,  // Language Preference (2-8 bytes AN)
+            0x9F4E   // Merchant Name and Location (var ANS)
+        )
     }
 
     /**
@@ -172,7 +200,9 @@ class DataStore {
 
     fun set(tagValue: Int, value: ByteArray) {
         data[tagValue] = value
-        dataByHex["%X".format(tagValue)] = value
+        // Use consistent hex formatting: 2 digits for 1-byte tags, 4 digits for 2-byte tags
+        val hexKey = if (tagValue > 0xFF) "%04X".format(tagValue) else "%02X".format(tagValue)
+        dataByHex[hexKey] = value
     }
 
     fun set(tagHex: String, value: ByteArray) {
@@ -233,7 +263,8 @@ class DataStore {
     }
 
     private fun Long.toAmount(): ByteArray {
-        // BCD encoded, 6 bytes
+        // BCD encoded, 6 bytes - amounts must be non-negative
+        require(this >= 0) { "Amount cannot be negative: $this" }
         val str = "%012d".format(this)
         return str.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
     }

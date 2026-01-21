@@ -307,10 +307,12 @@ class SecurityManager(
             return true
         }
 
-        // Try to execute su command
+        // Try to execute su command and verify it works
         return try {
-            Runtime.getRuntime().exec("su")
-            true
+            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "id"))
+            val exitCode = process.waitFor()
+            process.destroy()
+            exitCode == 0  // Only return true if su actually succeeded
         } catch (e: Exception) {
             false
         }
@@ -338,7 +340,7 @@ class SecurityManager(
     }
 
     private fun isUsbDebuggingEnabled(): Boolean {
-        return Settings.Secure.getInt(
+        return Settings.Global.getInt(
             context.contentResolver,
             Settings.Global.ADB_ENABLED,
             0
@@ -346,7 +348,7 @@ class SecurityManager(
     }
 
     private fun isDeveloperOptionsEnabled(): Boolean {
-        return Settings.Secure.getInt(
+        return Settings.Global.getInt(
             context.contentResolver,
             Settings.Global.DEVELOPMENT_SETTINGS_ENABLED,
             0

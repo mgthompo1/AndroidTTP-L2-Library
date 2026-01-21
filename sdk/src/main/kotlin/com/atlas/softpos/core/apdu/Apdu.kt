@@ -38,13 +38,33 @@ data class CommandApdu(
 
         // Lc and Data
         if (data != null && data.isNotEmpty()) {
-            result.add(data.size.toByte())
+            if (data.size <= 255) {
+                // Short APDU: single byte Lc
+                result.add(data.size.toByte())
+            } else {
+                // Extended APDU: 3-byte Lc (0x00 + 2 bytes big-endian)
+                result.add(0x00)
+                result.add((data.size shr 8).toByte())
+                result.add((data.size and 0xFF).toByte())
+            }
             result.addAll(data.toList())
         }
 
         // Le
         if (le != null) {
-            result.add(if (le == 256) 0x00.toByte() else le.toByte())
+            if (data != null && data.size > 255) {
+                // Extended Le: 2 bytes
+                if (le == 65536 || le == 0) {
+                    result.add(0x00)
+                    result.add(0x00)
+                } else {
+                    result.add((le shr 8).toByte())
+                    result.add((le and 0xFF).toByte())
+                }
+            } else {
+                // Short Le: single byte (0x00 = 256)
+                result.add(if (le == 256) 0x00.toByte() else le.toByte())
+            }
         }
 
         return result.toByteArray()

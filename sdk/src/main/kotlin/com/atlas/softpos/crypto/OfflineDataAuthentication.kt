@@ -684,14 +684,7 @@ class OfflineDataAuthentication(
 
 // ========== RESULT TYPES ==========
 
-sealed class OdaResult {
-    object NotSupported : OdaResult()
-    data class SdaSuccess(val dataAuthCode: ByteArray) : OdaResult()
-    object DdaSuccess : OdaResult()
-    object FddaSuccess : OdaResult()
-    data class CdaPrepared(val iccPublicKey: RecoveredPublicKey) : OdaResult()
-    data class Failed(val reason: OdaFailureReason) : OdaResult()
-}
+// Note: OdaResult sealed class is defined at the bottom of this file to avoid duplication
 
 enum class OdaFailureReason {
     ISSUER_KEY_RECOVERY_FAILED,

@@ -12,10 +12,15 @@ import com.atlas.softpos.core.tlv.Tlv
 import com.atlas.softpos.crypto.CaPublicKeyStore
 import com.atlas.softpos.crypto.OfflineDataAuthentication
 import com.atlas.softpos.crypto.OdaResult
+import com.atlas.softpos.crypto.OdaFailureReason
 import com.atlas.softpos.kernel.common.*
+import com.atlas.softpos.security.SecureMemory
 import timber.log.Timber
 import java.security.SecureRandom
 import java.util.*
+
+// Tag value for internal ODA data storage (not a standard EMV tag)
+private const val TAG_ODA_DATA = 0xDF8101
 
 /**
  * Visa Contactless Kernel (qVSDC/VCPS)
@@ -284,15 +289,12 @@ class VisaContactlessKernel(
         val response = transceiver.transceive(command)
 
         if (!response.isSuccess) {
-            Timber.e("GPO failed: SW=${response.statusWord}")
-            return when {
-                response.sw1 == 0x69.toByte() && response.sw2 == 0x84.toByte() ->
-                    GpoResult.ReferenceDataNotFound
-                response.sw1 == 0x69.toByte() && response.sw2 == 0x85.toByte() ->
-                    GpoResult.ConditionsNotSatisfied
-                response.sw1 == 0x6A.toByte() && response.sw2 == 0x81.toByte() ->
-                    GpoResult.FunctionNotSupported
-                else -> GpoResult.Error("GPO failed: ${response.statusWord}")
+            Timber.e("GPO failed: SW=%04X", response.sw)
+            return when (response.sw) {
+                0x6984 -> GpoResult.ReferenceDataNotFound
+                0x6985 -> GpoResult.ConditionsNotSatisfied
+                0x6A81 -> GpoResult.FunctionNotSupported
+                else -> GpoResult.Error("GPO failed: %04X".format(response.sw))
             }
         }
 
@@ -376,18 +378,40 @@ class VisaContactlessKernel(
 
     /**
      * Validate Application Interchange Profile
+     *
+     * AIP Byte 1 bits (per EMV Book 3):
+     *   b8 (0x80): Reserved for use by the payment systems
+     *   b7 (0x40): SDA supported
+     *   b6 (0x20): DDA supported
+     *   b5 (0x10): Cardholder verification is supported
+     *   b4 (0x08): Terminal risk management to be performed
+     *   b3 (0x04): Issuer authentication is supported
+     *   b2 (0x02): Reserved for use by the payment systems
+     *   b1 (0x01): CDA supported
+     *
+     * For Visa qVSDC, we check if any EMV processing is indicated.
+     * Card returning AIP in GPO means it supports EMV mode.
      */
     private fun validateAip(aip: ByteArray): Boolean {
         if (aip.size < 2) return false
 
-        // Check if card supports qVSDC
-        // AIP Byte 1, Bit 1: EMV mode supported
-        val emvSupported = (aip[0].toInt() and 0x01) != 0
+        val aipByte1 = aip[0].toInt() and 0xFF
 
-        Timber.d("AIP: ${aip.toHexString()}, EMV supported: $emvSupported")
+        // Check ODA support (SDA, DDA, or CDA)
+        val supportsSda = (aipByte1 and 0x40) != 0
+        val supportsDda = (aipByte1 and 0x20) != 0
+        val supportsCda = (aipByte1 and 0x01) != 0
+        val supportsOda = supportsSda || supportsDda || supportsCda
 
-        // For qVSDC, EMV mode must be supported
-        return emvSupported || config.supportMsd
+        // Check if terminal risk management required
+        val trmRequired = (aipByte1 and 0x08) != 0
+
+        Timber.d("AIP: ${aip.toHexString()}, SDA=$supportsSda, DDA=$supportsDda, CDA=$supportsCda, TRM=$trmRequired")
+
+        // For qVSDC, the card has already indicated EMV support by returning AIP.
+        // If MSD fallback is supported and no ODA methods available, allow MSD path.
+        // Otherwise, require at least some EMV capability indication.
+        return supportsOda || trmRequired || config.supportMsd
     }
 
     /**
@@ -433,7 +457,8 @@ class VisaContactlessKernel(
                 val recordTlvs = TlvParser.parseRecursive(recordData)
                 for (tlv in recordTlvs) {
                     cardData[tlv.tag.hex] = tlv
-                    Timber.v("Card data: ${tlv.tag.hex} = ${tlv.value.toHexString()}")
+                    // Log tag only, not value (may contain sensitive data like PAN/Track2)
+                    Timber.v("Card data: ${tlv.tag.hex} (${tlv.value.size} bytes)")
                 }
 
                 // Accumulate ODA data
@@ -449,8 +474,8 @@ class VisaContactlessKernel(
             }
         }
 
-        // Store ODA data for authentication
-        dataStore.set("ODA_DATA", odaData)
+        // Store ODA data for authentication (using proprietary tag)
+        dataStore.set(TAG_ODA_DATA, odaData)
 
         return true
     }
@@ -472,7 +497,7 @@ class VisaContactlessKernel(
         val response = transceiver.transceive(command)
 
         if (!response.isSuccess) {
-            Timber.e("Read record failed: SFI=$sfi, Record=$record, SW=${response.statusWord}")
+            Timber.e("Read record failed: SFI=$sfi, Record=$record, SW=%04X", response.sw)
             return null
         }
 
@@ -505,21 +530,29 @@ class VisaContactlessKernel(
         }
 
         // For full ODA, we need CA public key and certificates
-        val caIndex = cardData["8F"]?.value?.get(0)
-        if (caIndex == null) {
+        val caIndexValue = cardData["8F"]?.value
+        if (caIndexValue == null || caIndexValue.isEmpty()) {
             tvr.odaNotPerformed = true
             return OdaOutcome.Failed("Missing CA Public Key Index")
         }
+        val caIndex = caIndexValue[0]
 
-        val caKey = CaPublicKeyStore.getKey(selectedAid!!.copyOfRange(0, 5), caIndex)
+        // Validate AID length before truncating
+        val aid = selectedAid
+        if (aid == null || aid.size < 5) {
+            tvr.odaNotPerformed = true
+            return OdaOutcome.Failed("Invalid AID length")
+        }
+
+        val caKey = CaPublicKeyStore.getKey(aid.copyOfRange(0, 5), caIndex)
         if (caKey == null) {
             tvr.odaNotPerformed = true
             return OdaOutcome.Failed("CA Public Key not found")
         }
 
         // Create ODA processor
-        val oda = OfflineDataAuthentication(transceiver, cardData.mapValues { it.value })
-        val odaData = dataStore.get("ODA_DATA") ?: byteArrayOf()
+        val oda = OfflineDataAuthentication(caKey, cardData.mapValues { it.value.value })
+        val odaData = dataStore.get(TAG_ODA_DATA) ?: byteArrayOf()
 
         val result = oda.performOda(aip, odaData)
 
@@ -535,19 +568,26 @@ class VisaContactlessKernel(
                 tvr.odaNotPerformed = true
                 OdaOutcome.NotSupported
             }
+            is OdaResult.Success -> OdaOutcome.Success(result.type)
+            is OdaResult.Failure -> OdaOutcome.Failed(result.reason)
             is OdaResult.Failed -> {
+                val reason = result.failureReason
                 when {
-                    result.reason.name.contains("SDA") -> tvr.sdaFailed = true
-                    result.reason.name.contains("DDA") -> tvr.ddaFailed = true
-                    result.reason.name.contains("CDA") -> tvr.cdaFailed = true
+                    reason.name.contains("SDA") || reason == OdaFailureReason.INVALID_SSAD_FORMAT -> tvr.sdaFailed = true
+                    reason.name.contains("DDA") || reason == OdaFailureReason.DDA_SIGNATURE_INVALID -> tvr.ddaFailed = true
+                    reason.name.contains("CDA") -> tvr.cdaFailed = true
+                    reason.name.contains("FDDA") -> tvr.ddaFailed = true  // fDDA is a DDA variant
                 }
-                OdaOutcome.Failed(result.reason.name)
+                OdaOutcome.Failed(reason.name)
             }
         }
     }
 
     /**
      * Perform fDDA (Fast DDA) using data from GPO
+     *
+     * fDDA verifies the SDAD (Signed Dynamic Application Data) returned in GPO response.
+     * This requires recovering the ICC public key and verifying the signature.
      */
     private fun performFdda(sdad: ByteArray, iccDynamicNumber: ByteArray): OdaOutcome {
         Timber.d("Performing fDDA")
@@ -555,13 +595,82 @@ class VisaContactlessKernel(
         // Get terminal unpredictable number
         val un = dataStore.get(0x9F37) ?: return OdaOutcome.Failed("Missing UN")
 
-        // For fDDA, we'd verify the signature here
-        // This requires ICC public key recovery first
+        // Get CA public key index
+        val caIndexValue = cardData["8F"]?.value
+        if (caIndexValue == null || caIndexValue.isEmpty()) {
+            tvr.ddaFailed = true
+            return OdaOutcome.Failed("Missing CA Public Key Index for fDDA")
+        }
+        val caIndex = caIndexValue[0]
 
-        // For now, mark as successful if we have the data
-        // Real implementation needs full crypto verification
+        // Validate AID
+        val aid = selectedAid
+        if (aid == null || aid.size < 5) {
+            tvr.ddaFailed = true
+            return OdaOutcome.Failed("Invalid AID for fDDA")
+        }
 
-        return OdaOutcome.Success("fDDA")
+        // Get CA public key
+        val caKey = CaPublicKeyStore.getKey(aid.copyOfRange(0, 5), caIndex)
+        if (caKey == null) {
+            tvr.ddaFailed = true
+            return OdaOutcome.Failed("CA Public Key not found for fDDA")
+        }
+
+        // Get issuer public key certificate (tag 90)
+        val issuerCert = cardData["90"]?.value
+        if (issuerCert == null) {
+            tvr.ddaFailed = true
+            return OdaOutcome.Failed("Missing Issuer Public Key Certificate")
+        }
+
+        // Get ICC public key certificate (tag 9F46)
+        val iccCert = cardData["9F46"]?.value
+        if (iccCert == null) {
+            tvr.ddaFailed = true
+            return OdaOutcome.Failed("Missing ICC Public Key Certificate")
+        }
+
+        // Create ODA processor and perform fDDA verification
+        val oda = OfflineDataAuthentication(caKey, cardData.mapValues { it.value.value })
+
+        // Build fDDA input: terminal data that was signed
+        val amountAuthorized = dataStore.get(0x9F02) ?: ByteArray(6)
+        val amountOther = dataStore.get(0x9F03) ?: ByteArray(6)
+        val terminalCountryCode = dataStore.get(0x9F1A) ?: ByteArray(2)
+        val tvr = dataStore.get(0x95) ?: ByteArray(5)
+        val currencyCode = dataStore.get(0x5F2A) ?: ByteArray(2)
+        val transactionDate = dataStore.get(0x9A) ?: ByteArray(3)
+        val transactionType = dataStore.get(0x9C) ?: ByteArray(1)
+
+        val fddaResult = oda.verifyFdda(
+            sdad = sdad,
+            iccDynamicNumber = iccDynamicNumber,
+            unpredictableNumber = un,
+            amountAuthorized = amountAuthorized,
+            amountOther = amountOther,
+            terminalCountryCode = terminalCountryCode,
+            tvr = tvr,
+            currencyCode = currencyCode,
+            transactionDate = transactionDate,
+            transactionType = transactionType
+        )
+
+        return when (fddaResult) {
+            is OdaResult.FddaSuccess -> OdaOutcome.Success("fDDA")
+            is OdaResult.Failed -> {
+                this.tvr.ddaFailed = true
+                OdaOutcome.Failed(fddaResult.failureReason.name)
+            }
+            is OdaResult.Failure -> {
+                this.tvr.ddaFailed = true
+                OdaOutcome.Failed(fddaResult.reason)
+            }
+            else -> {
+                this.tvr.ddaFailed = true
+                OdaOutcome.Failed("Unexpected fDDA result")
+            }
+        }
     }
 
     /**
@@ -573,13 +682,17 @@ class VisaContactlessKernel(
             return
         }
 
-        // Expiry format: YYMMDD
-        val expYear = 2000 + ((expiryDate[0].toInt() and 0xF0) shr 4) * 10 + (expiryDate[0].toInt() and 0x0F)
+        // Expiry format: YYMMDD (BCD encoded)
+        val expYearYY = ((expiryDate[0].toInt() and 0xF0) shr 4) * 10 + (expiryDate[0].toInt() and 0x0F)
         val expMonth = ((expiryDate[1].toInt() and 0xF0) shr 4) * 10 + (expiryDate[1].toInt() and 0x0F)
 
         val calendar = Calendar.getInstance()
         val currentYear = calendar.get(Calendar.YEAR)
         val currentMonth = calendar.get(Calendar.MONTH) + 1
+
+        // Convert 2-digit year to 4-digit year using sliding window
+        // Cards typically valid for ~10 years, so use current century with adjustment
+        val expYear = bcdYearToFullYear(expYearYY, currentYear)
 
         if (expYear < currentYear || (expYear == currentYear && expMonth < currentMonth)) {
             tvr.expiredApplication = true
@@ -589,8 +702,9 @@ class VisaContactlessKernel(
         // Check effective date if present
         val effectiveDate = cardData["5F25"]?.value
         if (effectiveDate != null && effectiveDate.size >= 3) {
-            val effYear = 2000 + ((effectiveDate[0].toInt() and 0xF0) shr 4) * 10 + (effectiveDate[0].toInt() and 0x0F)
+            val effYearYY = ((effectiveDate[0].toInt() and 0xF0) shr 4) * 10 + (effectiveDate[0].toInt() and 0x0F)
             val effMonth = ((effectiveDate[1].toInt() and 0xF0) shr 4) * 10 + (effectiveDate[1].toInt() and 0x0F)
+            val effYear = bcdYearToFullYear(effYearYY, currentYear)
 
             if (effYear > currentYear || (effYear == currentYear && effMonth > currentMonth)) {
                 tvr.applicationNotYetEffective = true
@@ -752,17 +866,21 @@ class VisaContactlessKernel(
         // Build CDOL1 data
         val cdolData = DolParser.buildDolData(cdol1, dataStore)
 
-        // Determine reference control parameter
-        val p1 = when (decision) {
-            CryptogramDecision.AAC -> 0x00      // AAC
-            CryptogramDecision.TC -> 0x40       // TC
+        // Determine reference control parameter (P1 for GENERATE AC)
+        // Bits 8-7: Cryptogram type requested
+        //   00 = AAC (Application Authentication Cryptogram - decline)
+        //   01 = TC (Transaction Certificate - offline approve)
+        //   10 = ARQC (Authorization Request Cryptogram - online)
+        val p1: Byte = when (decision) {
+            CryptogramDecision.AAC -> 0x00.toByte()     // AAC
+            CryptogramDecision.TC -> 0x40.toByte()      // TC
             CryptogramDecision.ARQC -> 0x80.toByte()    // ARQC
         }
 
         val command = CommandApdu(
             cla = 0x80.toByte(),
             ins = 0xAE.toByte(),
-            p1 = p1.toByte(),
+            p1 = p1,
             p2 = 0x00,
             data = cdolData,
             le = 0x00
@@ -771,7 +889,7 @@ class VisaContactlessKernel(
         val response = transceiver.transceive(command)
 
         if (!response.isSuccess) {
-            return VisaKernelOutcome.EndApplication("GENERATE AC failed: ${response.statusWord}")
+            return VisaKernelOutcome.EndApplication("GENERATE AC failed: %04X".format(response.sw))
         }
 
         // Parse response
@@ -941,6 +1059,29 @@ class VisaContactlessKernel(
         }
     }
 
+    /**
+     * Convert 2-digit BCD year to 4-digit year using sliding window algorithm.
+     *
+     * Uses a 80-year window: years 00-79 map to 2000-2079, years 80-99 map to 1980-1999.
+     * This handles the Y2K issue and extends validity to 2079.
+     *
+     * @param yy 2-digit year (0-99)
+     * @param currentYear Current 4-digit year for context
+     * @return Full 4-digit year
+     */
+    private fun bcdYearToFullYear(yy: Int, currentYear: Int): Int {
+        val currentCentury = (currentYear / 100) * 100
+        val currentYY = currentYear % 100
+
+        // Use sliding window: if yy is more than 20 years in the past from current YY,
+        // assume it's in the next century. If more than 80 years in the future, assume previous century.
+        return when {
+            yy >= 80 && currentYY < 80 -> currentCentury - 100 + yy  // e.g., 99 in 2025 = 1999
+            yy < 20 && currentYY >= 80 -> currentCentury + 100 + yy  // e.g., 05 in 2099 = 2105
+            else -> currentCentury + yy
+        }
+    }
+
     // Extension functions
     private fun ByteArray.toHexString() = joinToString("") { "%02X".format(it) }
     private fun Byte.toHexString() = "%02X".format(this)
@@ -954,7 +1095,24 @@ sealed class GpoResult {
         val afl: ByteArray,
         val ctq: ByteArray?,
         val sdad: ByteArray?
-    ) : GpoResult()
+    ) : GpoResult() {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is Success) return false
+            return aip.contentEquals(other.aip) &&
+                    afl.contentEquals(other.afl) &&
+                    ctq.contentEquals(other.ctq) &&
+                    sdad.contentEquals(other.sdad)
+        }
+
+        override fun hashCode(): Int {
+            var result = aip.contentHashCode()
+            result = 31 * result + afl.contentHashCode()
+            result = 31 * result + (ctq?.contentHashCode() ?: 0)
+            result = 31 * result + (sdad?.contentHashCode() ?: 0)
+            return result
+        }
+    }
     object ConditionsNotSatisfied : GpoResult()
     object ReferenceDataNotFound : GpoResult()
     object FunctionNotSupported : GpoResult()
@@ -987,7 +1145,28 @@ data class AcResponse(
     val iad: ByteArray,
     val cryptogramType: CryptogramType,
     val sdad: ByteArray? = null
-)
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is AcResponse) return false
+        return cid == other.cid &&
+                atc.contentEquals(other.atc) &&
+                cryptogram.contentEquals(other.cryptogram) &&
+                iad.contentEquals(other.iad) &&
+                cryptogramType == other.cryptogramType &&
+                sdad.contentEquals(other.sdad)
+    }
+
+    override fun hashCode(): Int {
+        var result = cid.toInt()
+        result = 31 * result + atc.contentHashCode()
+        result = 31 * result + cryptogram.contentHashCode()
+        result = 31 * result + iad.contentHashCode()
+        result = 31 * result + cryptogramType.hashCode()
+        result = 31 * result + (sdad?.contentHashCode() ?: 0)
+        return result
+    }
+}
 
 sealed class VisaKernelOutcome {
     data class Approved(val authData: VisaAuthorizationData) : VisaKernelOutcome()
@@ -1047,7 +1226,58 @@ data class VisaKernelConfiguration(
     val tacDenial: ByteArray = byteArrayOf(0x00, 0x00, 0x00, 0x00, 0x00),
     val tacOnline: ByteArray = byteArrayOf(0xFC.toByte(), 0x50.toByte(), 0xBC.toByte(), 0x80.toByte(), 0x00),
     val tacDefault: ByteArray = byteArrayOf(0xFC.toByte(), 0x50.toByte(), 0xBC.toByte(), 0xF8.toByte(), 0x00)
-)
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is VisaKernelConfiguration) return false
+        return terminalCountryCode.contentEquals(other.terminalCountryCode) &&
+                transactionCurrencyCode.contentEquals(other.transactionCurrencyCode) &&
+                terminalCapabilities.contentEquals(other.terminalCapabilities) &&
+                terminalType == other.terminalType &&
+                additionalTerminalCapabilities.contentEquals(other.additionalTerminalCapabilities) &&
+                ifdSerialNumber.contentEquals(other.ifdSerialNumber) &&
+                merchantCategoryCode.contentEquals(other.merchantCategoryCode) &&
+                terminalFloorLimit == other.terminalFloorLimit &&
+                cvmRequiredLimit == other.cvmRequiredLimit &&
+                contactlessTransactionLimit == other.contactlessTransactionLimit &&
+                acquirerId.contentEquals(other.acquirerId) &&
+                terminalId.contentEquals(other.terminalId) &&
+                merchantId.contentEquals(other.merchantId) &&
+                transactionSequenceNumber.contentEquals(other.transactionSequenceNumber) &&
+                supportMsd == other.supportMsd &&
+                supportOnlinePin == other.supportOnlinePin &&
+                supportSignature == other.supportSignature &&
+                randomSelectionThreshold == other.randomSelectionThreshold &&
+                tacDenial.contentEquals(other.tacDenial) &&
+                tacOnline.contentEquals(other.tacOnline) &&
+                tacDefault.contentEquals(other.tacDefault)
+    }
+
+    override fun hashCode(): Int {
+        var result = terminalCountryCode.contentHashCode()
+        result = 31 * result + transactionCurrencyCode.contentHashCode()
+        result = 31 * result + terminalCapabilities.contentHashCode()
+        result = 31 * result + terminalType.toInt()
+        result = 31 * result + additionalTerminalCapabilities.contentHashCode()
+        result = 31 * result + ifdSerialNumber.contentHashCode()
+        result = 31 * result + merchantCategoryCode.contentHashCode()
+        result = 31 * result + terminalFloorLimit.hashCode()
+        result = 31 * result + cvmRequiredLimit.hashCode()
+        result = 31 * result + contactlessTransactionLimit.hashCode()
+        result = 31 * result + (acquirerId?.contentHashCode() ?: 0)
+        result = 31 * result + (terminalId?.contentHashCode() ?: 0)
+        result = 31 * result + (merchantId?.contentHashCode() ?: 0)
+        result = 31 * result + (transactionSequenceNumber?.contentHashCode() ?: 0)
+        result = 31 * result + supportMsd.hashCode()
+        result = 31 * result + supportOnlinePin.hashCode()
+        result = 31 * result + supportSignature.hashCode()
+        result = 31 * result + randomSelectionThreshold
+        result = 31 * result + tacDenial.contentHashCode()
+        result = 31 * result + tacOnline.contentHashCode()
+        result = 31 * result + tacDefault.contentHashCode()
+        return result
+    }
+}
 
 data class VisaTransactionData(
     val amount: Long,
