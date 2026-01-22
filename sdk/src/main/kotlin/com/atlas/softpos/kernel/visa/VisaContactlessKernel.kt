@@ -108,14 +108,34 @@ class VisaContactlessKernel(
             }
 
             // Extract critical data
-            val pan = cardData["5A"]?.value
-            val track2 = cardData["57"]?.value
+            var pan = cardData["5A"]?.value
+            var track2 = cardData["57"]?.value
             val expiryDate = cardData["5F24"]?.value
 
-            if (pan == null || track2 == null) {
-                tvr.iccDataMissing = true
-                return VisaKernelOutcome.EndApplication("Missing critical card data")
+            // For qVSDC, card may only return Track 2 without separate PAN tag
+            // Extract PAN from Track 2 if not provided separately
+            if (pan == null && track2 != null) {
+                pan = extractPanFromTrack2(track2)
+                if (pan != null) {
+                    Timber.d("Extracted PAN from Track 2")
+                }
             }
+
+            // Need at least Track 2 for transaction processing
+            if (track2 == null) {
+                tvr.iccDataMissing = true
+                return VisaKernelOutcome.EndApplication("Missing Track 2 data")
+            }
+
+            // If we still don't have PAN, try to construct it from track2 or fail
+            if (pan == null) {
+                tvr.iccDataMissing = true
+                return VisaKernelOutcome.EndApplication("Could not extract PAN from card data")
+            }
+
+            // At this point both pan and track2 are guaranteed non-null
+            val validPan = pan
+            val validTrack2 = track2
 
             // Step 3: Offline Data Authentication
             val odaOutcome = performOda(gpoResult.aip, transaction)
@@ -140,7 +160,7 @@ class VisaContactlessKernel(
             val decision = performTerminalActionAnalysis()
 
             // Step 8: Generate AC
-            return generateApplicationCryptogram(decision, transaction, pan, track2)
+            return generateApplicationCryptogram(decision, transaction, validPan, validTrack2)
 
         } catch (e: Exception) {
             Timber.e(e, "Visa kernel exception")
@@ -369,6 +389,19 @@ class VisaContactlessKernel(
         sdad?.let { cardData["9F4B"] = Tlv.fromHex("9F4B", it.toHexString()) }
         iccDynamicNumber?.let { cardData["9F4C"] = Tlv.fromHex("9F4C", it.toHexString()) }
 
+        // For qVSDC, card data may be returned directly in GPO response
+        // Store any card data elements present (PAN, Track2, expiry, etc.)
+        tlvMap["5A"]?.let { cardData["5A"] = it }      // PAN
+        tlvMap["57"]?.let { cardData["57"] = it }      // Track 2 Equivalent Data
+        tlvMap["5F24"]?.let { cardData["5F24"] = it }  // Application Expiration Date
+        tlvMap["5F20"]?.let { cardData["5F20"] = it }  // Cardholder Name
+        tlvMap["5F28"]?.let { cardData["5F28"] = it }  // Issuer Country Code
+        tlvMap["5F34"]?.let { cardData["5F34"] = it }  // PAN Sequence Number
+        tlvMap["9F27"]?.let { cardData["9F27"] = it }  // Cryptogram Information Data
+        tlvMap["9F26"]?.let { cardData["9F26"] = it }  // Application Cryptogram
+        tlvMap["9F10"]?.let { cardData["9F10"] = it }  // Issuer Application Data
+        tlvMap["9F36"]?.let { cardData["9F36"] = it }  // Application Transaction Counter
+
         return GpoResult.Success(
             aip = aip,
             afl = afl,
@@ -410,9 +443,33 @@ class VisaContactlessKernel(
         Timber.d("AIP: ${aip.toHexString()}, SDA=$supportsSda, DDA=$supportsDda, CDA=$supportsCda, TRM=$trmRequired")
 
         // For qVSDC, the card has already indicated EMV support by returning AIP.
-        // If MSD fallback is supported and no ODA methods available, allow MSD path.
-        // Otherwise, require at least some EMV capability indication.
-        return supportsOda || trmRequired || config.supportMsd
+        // AIP=0000 is valid for online-only cards that don't support ODA.
+        // SoftPOS terminals are inherently online-only, so we accept these cards
+        // and proceed with online authorization (ARQC).
+        // Accept if: any ODA method, TRM required, MSD supported, or online-only (AIP=0000)
+        val isOnlineOnly = aip[0].toInt() == 0 && aip[1].toInt() == 0
+        return supportsOda || trmRequired || config.supportMsd || isOnlineOnly
+    }
+
+    /**
+     * Extract PAN from Track 2 Equivalent Data
+     * Track 2 format: PAN + 'D' (0x0D) + Expiry + Service Code + Discretionary Data
+     * The 'D' separator is encoded as 0x0D in the nibble stream
+     */
+    private fun extractPanFromTrack2(track2: ByteArray): ByteArray? {
+        // Convert to hex string to find 'D' separator
+        val hex = track2.toHexString().uppercase()
+        val separatorIndex = hex.indexOf('D')
+        if (separatorIndex <= 0) return null
+
+        // PAN is before the 'D' separator
+        val panHex = hex.substring(0, separatorIndex)
+        // Remove trailing 'F' padding if present
+        val cleanPanHex = panHex.trimEnd('F')
+        if (cleanPanHex.length < 13 || cleanPanHex.length > 19) return null
+
+        // Convert back to BCD-encoded bytes
+        return cleanPanHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
     }
 
     /**
@@ -853,6 +910,42 @@ class VisaContactlessKernel(
     ): VisaKernelOutcome {
         Timber.d("Generating AC: $decision")
 
+        // For qVSDC, check if cryptogram data was already returned in GPO response
+        val preComputedCryptogram = cardData["9F26"]?.value
+        val preComputedCid = cardData["9F27"]?.value
+        val preComputedAtc = cardData["9F36"]?.value
+        val preComputedIad = cardData["9F10"]?.value
+
+        if (preComputedCryptogram != null && preComputedCid != null && preComputedAtc != null) {
+            Timber.d("Using pre-computed cryptogram from GPO response")
+
+            // Extract CID byte value
+            val cidByte = preComputedCid[0]
+
+            // Build authorization data from GPO response data
+            val authData = buildAuthorizationData(
+                pan = pan,
+                track2 = track2,
+                cryptogram = preComputedCryptogram,
+                cid = cidByte,
+                atc = preComputedAtc,
+                iad = preComputedIad ?: byteArrayOf(),
+                transaction = transaction
+            )
+
+            // CID byte determines cryptogram type:
+            // 0x80 = ARQC (online authorization required)
+            // 0x40 = TC (offline approved)
+            // 0x00 = AAC (declined)
+            val cidValue = cidByte.toInt() and 0xC0
+            return when (cidValue) {
+                0x80 -> VisaKernelOutcome.OnlineRequest(authData)
+                0x40 -> VisaKernelOutcome.Approved(authData)
+                else -> VisaKernelOutcome.Declined(authData, "Card returned AAC")
+            }
+        }
+
+        // No pre-computed cryptogram - need to send GENERATE AC command
         // Get CDOL1
         val cdol1 = cardData["8C"]?.value
         if (cdol1 == null || cdol1.isEmpty()) {

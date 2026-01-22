@@ -196,24 +196,34 @@ class MainActivity : ComponentActivity() {
                 log("Found ${availableAids.size} payment application(s)", LogLevel.INFO)
 
                 // Select first available AID and determine kernel
-                val selectedAid = availableAids.first()
-                detectedAid.value = selectedAid.toHexString()
-                log("Selected AID: ${selectedAid.toHexString()}", LogLevel.INFO)
+                val candidateAid = availableAids.first()
+                detectedAid.value = candidateAid.toHexString()
+                log("Candidate AID: ${candidateAid.toHexString()}", LogLevel.INFO)
+
+                // Actually SELECT the AID on the card to get FCI/PDOL
+                val selectResult = selectAid(transceiver, candidateAid)
+                if (!selectResult.success) {
+                    withContext(Dispatchers.Main) {
+                        transactionState.value = TransactionState.ERROR
+                        outcomeMessage.value = "Failed to select AID"
+                    }
+                    return@withContext
+                }
 
                 // Determine which kernel to use based on AID
                 val amount = amountCents.value.toLongOrNull() ?: 1000L
 
                 when {
-                    isVisaAid(selectedAid) -> {
-                        processVisaTransaction(transceiver, selectedAid, amount)
+                    isVisaAid(candidateAid) -> {
+                        processVisaTransaction(transceiver, candidateAid, selectResult.pdol, amount)
                     }
-                    isMastercardAid(selectedAid) -> {
-                        processMastercardTransaction(transceiver, selectedAid, amount)
+                    isMastercardAid(candidateAid) -> {
+                        processMastercardTransaction(transceiver, candidateAid, selectResult.pdol, amount)
                     }
                     else -> {
                         withContext(Dispatchers.Main) {
                             transactionState.value = TransactionState.ERROR
-                            outcomeMessage.value = "Unsupported card type: ${selectedAid.toHexString()}"
+                            outcomeMessage.value = "Unsupported card type: ${candidateAid.toHexString()}"
                         }
                     }
                 }
@@ -233,6 +243,7 @@ class MainActivity : ComponentActivity() {
     private suspend fun processVisaTransaction(
         transceiver: CardTransceiver,
         aid: ByteArray,
+        pdol: ByteArray?,
         amountCents: Long
     ) {
         log("Processing Visa transaction...", LogLevel.INFO)
@@ -258,7 +269,7 @@ class MainActivity : ComponentActivity() {
         )
 
         val kernel = VisaContactlessKernel(transceiver, config)
-        val outcome = kernel.processTransaction(aid, null, transactionData)
+        val outcome = kernel.processTransaction(aid, pdol, transactionData)
 
         withContext(Dispatchers.Main) {
             when (outcome) {
@@ -301,6 +312,7 @@ class MainActivity : ComponentActivity() {
     private suspend fun processMastercardTransaction(
         transceiver: CardTransceiver,
         aid: ByteArray,
+        pdol: ByteArray?,
         amountCents: Long
     ) {
         log("Processing Mastercard transaction...", LogLevel.INFO)
@@ -316,7 +328,7 @@ class MainActivity : ComponentActivity() {
         val application = SelectedApplication(
             aid = aid,
             label = "Mastercard",
-            pdol = null,
+            pdol = pdol,
             languagePreference = null,
             fciData = byteArrayOf()
         )
@@ -383,6 +395,93 @@ class MainActivity : ComponentActivity() {
             le = 0
         )
     }
+
+    /**
+     * Select an AID and return the FCI data containing PDOL
+     */
+    private suspend fun selectAid(transceiver: CardTransceiver, aid: ByteArray): SelectAidResult {
+        val selectCommand = buildSelectCommand(aid)
+        log("Selecting AID: ${aid.toHexString()}", LogLevel.DEBUG)
+
+        val response = transceiver.transceive(selectCommand)
+
+        if (response.sw1 != 0x90.toByte() || response.sw2 != 0x00.toByte()) {
+            log("AID selection failed: SW=${response.sw.toString(16)}", LogLevel.ERROR)
+            return SelectAidResult(success = false, fci = null, pdol = null)
+        }
+
+        log("AID selected successfully", LogLevel.DEBUG)
+
+        // Extract PDOL from FCI (tag 9F38)
+        val pdol = extractPdolFromFci(response.data)
+        if (pdol != null) {
+            log("PDOL found: ${pdol.toHexString()}", LogLevel.DEBUG)
+        } else {
+            log("No PDOL in FCI", LogLevel.DEBUG)
+        }
+
+        return SelectAidResult(success = true, fci = response.data, pdol = pdol)
+    }
+
+    /**
+     * Extract PDOL (tag 9F38) from FCI template
+     */
+    private fun extractPdolFromFci(fci: ByteArray): ByteArray? {
+        // FCI Template is tag 6F
+        val fciTemplate = findTlvTag(fci, 0x6F) ?: return null
+        // FCI Proprietary is tag A5
+        val fciProprietary = findTlvTag(fciTemplate, 0xA5) ?: return null
+        // PDOL is tag 9F38
+        return findTlvTag(fciProprietary, 0x9F38)
+    }
+
+    /**
+     * Simple TLV tag finder
+     */
+    private fun findTlvTag(data: ByteArray, targetTag: Int): ByteArray? {
+        var i = 0
+        while (i < data.size) {
+            // Read tag
+            var tag = data[i].toInt() and 0xFF
+            i++
+
+            // Check for two-byte tag
+            if ((tag and 0x1F) == 0x1F && i < data.size) {
+                tag = (tag shl 8) or (data[i].toInt() and 0xFF)
+                i++
+            }
+
+            if (i >= data.size) break
+
+            // Read length
+            var length = data[i].toInt() and 0xFF
+            i++
+
+            if (length == 0x81 && i < data.size) {
+                length = data[i].toInt() and 0xFF
+                i++
+            } else if (length == 0x82 && i + 1 < data.size) {
+                length = ((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)
+                i += 2
+            }
+
+            if (i + length > data.size) break
+
+            // Check if this is our tag
+            if (tag == targetTag) {
+                return data.copyOfRange(i, i + length)
+            }
+
+            i += length
+        }
+        return null
+    }
+
+    data class SelectAidResult(
+        val success: Boolean,
+        val fci: ByteArray?,
+        val pdol: ByteArray?
+    )
 
     private fun parsePpseResponse(response: ByteArray): List<ByteArray> {
         val aids = mutableListOf<ByteArray>()
@@ -580,7 +679,7 @@ class MainActivity : ComponentActivity() {
         joinToString("") { "%02X".format(it) }
 
     private fun List<Byte>.toByteArray(): ByteArray =
-        this.toByteArray()
+        ByteArray(size) { this[it] }
 
     /**
      * IsoDep transceiver implementation
