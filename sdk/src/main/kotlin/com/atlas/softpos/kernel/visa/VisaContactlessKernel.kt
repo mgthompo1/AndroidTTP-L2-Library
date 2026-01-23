@@ -733,14 +733,28 @@ class VisaContactlessKernel(
      * Check processing restrictions
      */
     private fun checkProcessingRestrictions(expiryDate: ByteArray?) {
-        if (expiryDate == null || expiryDate.size < 3) {
-            tvr.expiredApplication = true
-            return
-        }
+        var expYearYY: Int
+        var expMonth: Int
 
-        // Expiry format: YYMMDD (BCD encoded)
-        val expYearYY = ((expiryDate[0].toInt() and 0xF0) shr 4) * 10 + (expiryDate[0].toInt() and 0x0F)
-        val expMonth = ((expiryDate[1].toInt() and 0xF0) shr 4) * 10 + (expiryDate[1].toInt() and 0x0F)
+        if (expiryDate != null && expiryDate.size >= 3) {
+            // Use tag 5F24 (Application Expiration Date) - format YYMMDD
+            expYearYY = ((expiryDate[0].toInt() and 0xF0) shr 4) * 10 + (expiryDate[0].toInt() and 0x0F)
+            expMonth = ((expiryDate[1].toInt() and 0xF0) shr 4) * 10 + (expiryDate[1].toInt() and 0x0F)
+        } else {
+            // Tag 5F24 not present - try to extract from Track 2 (tag 57)
+            // Track 2 format: PAN + 'D' + YYMM + Service Code + ...
+            val track2 = cardData["57"]?.value
+            val expiryFromTrack2 = extractExpiryFromTrack2(track2)
+            if (expiryFromTrack2 != null) {
+                expYearYY = expiryFromTrack2.first
+                expMonth = expiryFromTrack2.second
+                Timber.d("Using expiry from Track 2: $expMonth/$expYearYY")
+            } else {
+                // No expiry date available - don't mark as expired, let issuer decide
+                Timber.w("No expiry date found in 5F24 or Track 2")
+                return
+            }
+        }
 
         val calendar = Calendar.getInstance()
         val currentYear = calendar.get(Calendar.YEAR)
@@ -795,6 +809,31 @@ class VisaContactlessKernel(
         // For SoftPOS (non-ATM, goods/services), check appropriate bits
         if (!nonAtmsAllowed) {
             tvr.serviceNotAllowed = true
+        }
+    }
+
+    /**
+     * Extract expiry date (YYMM) from Track 2 data
+     * Track 2 format: PAN + 'D' (separator) + YYMM (expiry) + Service Code + ...
+     * Returns Pair(YY, MM) or null if not found
+     */
+    private fun extractExpiryFromTrack2(track2: ByteArray?): Pair<Int, Int>? {
+        if (track2 == null || track2.size < 10) return null
+
+        val track2Hex = track2.toHexString()
+        // Find separator 'D' in the hex string
+        val separatorIndex = track2Hex.indexOf('D', ignoreCase = true)
+        if (separatorIndex == -1 || separatorIndex + 4 > track2Hex.length) return null
+
+        // Expiry is 4 chars after separator (YYMM format)
+        val expiryStr = track2Hex.substring(separatorIndex + 1, separatorIndex + 5)
+        return try {
+            val yy = expiryStr.substring(0, 2).toInt()
+            val mm = expiryStr.substring(2, 4).toInt()
+            if (mm in 1..12) Pair(yy, mm) else null
+        } catch (e: Exception) {
+            Timber.w("Failed to parse expiry from Track 2: $expiryStr")
+            null
         }
     }
 
