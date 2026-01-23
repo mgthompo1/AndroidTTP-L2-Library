@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TTP Demo</string>
+    <string name="catalog_title">Atlas Coffee Shop</string>
+    <string name="cart_title">Your Cart</string>
+    <string name="checkout_title">Checkout</string>
+    <string name="receipt_title">Receipt</string>
+    <string name="add_to_cart">Add to Cart</string>
+    <string name="proceed_to_checkout">Proceed to Checkout</string>
+    <string name="tap_card_to_pay">Tap Card to Pay</string>
+    <string name="new_transaction">New Transaction</string>
+    <string name="empty_cart">Your cart is empty</string>
+    <string name="subtotal">Subtotal</string>
+    <string name="tax">Tax</string>
+    <string name="total">Total</string>
+    <string name="transaction_approved">Transaction Approved</string>
+    <string name="transaction_declined">Transaction Declined</string>
+    <string name="online_auth_required">Online Authorization Required</string>
+    <string name="detecting_card">Detecting Card...</string>
+    <string name="reading_card">Reading Card...</string>
+    <string name="processing_payment">Processing Payment...</string>
+    <string name="view_cart">View Cart</string>
+</resources>

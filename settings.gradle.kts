@@ -17,3 +17,4 @@ dependencyResolutionManagement {
 rootProject.name = "emv-softpos-sdk"
 include(":sdk")
 include(":sample")
+include(":ttp-demo")
