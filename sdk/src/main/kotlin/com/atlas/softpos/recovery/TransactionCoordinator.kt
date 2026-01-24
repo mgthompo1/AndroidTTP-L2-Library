@@ -22,6 +22,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import timber.log.Timber
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Transaction Coordinator
@@ -63,11 +64,30 @@ class TransactionCoordinator(
     private val _events = MutableSharedFlow<TransactionEvent>()
     val events: SharedFlow<TransactionEvent> = _events.asSharedFlow()
 
-    private var currentJob: Job? = null
+    private val currentJob = AtomicReference<Job?>(null)
     private val isProcessing = AtomicBoolean(false)
+    private val isCancelled = AtomicBoolean(false)
+    private val transactionScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     // PIN entry callback (set by UI layer)
     var onPinEntryRequired: (suspend (String, Long) -> OnlinePinResult)? = null
+
+    /**
+     * Start a new transaction asynchronously
+     * Returns a Deferred that can be awaited or cancelled
+     */
+    fun startTransactionAsync(
+        amount: Long,
+        tag: Tag,
+        transactionType: Byte = 0x00,
+        cashbackAmount: Long = 0
+    ): Deferred<TransactionOutcome> {
+        val deferred = transactionScope.async {
+            startTransaction(amount, tag, transactionType, cashbackAmount)
+        }
+        currentJob.set(deferred)
+        return deferred
+    }
 
     /**
      * Start a new transaction
@@ -83,12 +103,18 @@ class TransactionCoordinator(
             return TransactionOutcome.Error("Transaction already in progress")
         }
 
+        // Reset cancellation flag for new transaction
+        isCancelled.set(false)
+
+        // Track IsoDep for cleanup in finally
+        var isoDep: IsoDep? = null
+
         try {
             _state.value = TransactionState.Processing("Connecting to card...")
             emitEvent(TransactionEvent.Started(amount))
 
             // Get IsoDep interface
-            val isoDep = IsoDep.get(tag)
+            isoDep = IsoDep.get(tag)
             if (isoDep == null) {
                 val error = errorRecovery.classifyError(IllegalStateException("Card does not support IsoDep"))
                 _state.value = TransactionState.Error(error)
@@ -114,10 +140,22 @@ class TransactionCoordinator(
                 }
             }
 
+            // Check for cancellation after connection
+            if (isCancelled.get()) {
+                Timber.d("Transaction cancelled after card connection")
+                return TransactionOutcome.Error("Transaction cancelled")
+            }
+
             // Create transceiver with recovery
             val transceiver = RecoveringTransceiver(isoDep, errorRecovery)
 
             _state.value = TransactionState.Processing("Reading card...")
+
+            // Check for cancellation before kernel selection
+            if (isCancelled.get()) {
+                Timber.d("Transaction cancelled before kernel selection")
+                return TransactionOutcome.Error("Transaction cancelled")
+            }
 
             // Select PPSE and determine kernel
             val kernelResult = selectKernel(transceiver)
@@ -135,6 +173,12 @@ class TransactionCoordinator(
             }
 
             val selectedKernel = kernelResult as KernelSelection.Selected
+
+            // Check for cancellation before kernel processing
+            if (isCancelled.get()) {
+                Timber.d("Transaction cancelled before kernel processing")
+                return TransactionOutcome.Error("Transaction cancelled")
+            }
 
             _state.value = TransactionState.Processing("Processing transaction...")
 
@@ -161,67 +205,122 @@ class TransactionCoordinator(
                 }
             }
 
-            // Handle outcome
-            when (outcome) {
-                is TransactionOutcome.OnlineRequired -> {
-                    _state.value = TransactionState.Complete(outcome)
-                    emitEvent(TransactionEvent.OnlineAuthRequired(outcome.authData))
-                }
-                is TransactionOutcome.Approved -> {
-                    _state.value = TransactionState.Complete(outcome)
-                    emitEvent(TransactionEvent.Completed(outcome))
-                }
-                is TransactionOutcome.Declined -> {
-                    _state.value = TransactionState.Complete(outcome)
-                    emitEvent(TransactionEvent.Completed(outcome))
-                }
-                is TransactionOutcome.Error -> {
-                    val error = ErrorInfo(
-                        category = ErrorCategory.PROCESSING_ERROR,
-                        message = outcome.reason,
-                        isRetryable = false,
-                        canRetryManually = true,
-                        userMessage = outcome.reason,
-                        recoveryAction = RecoveryAction.RESTART_TRANSACTION
-                    )
-                    _state.value = TransactionState.Error(error)
-                    emitEvent(TransactionEvent.Failed(error))
-                }
-                is TransactionOutcome.TryAnotherInterface -> {
-                    val error = ErrorInfo(
-                        category = ErrorCategory.CARD_NOT_SUPPORTED,
-                        message = "Card requires insert or swipe",
-                        isRetryable = false,
-                        canRetryManually = false,
-                        userMessage = "Please insert or swipe this card",
-                        recoveryAction = RecoveryAction.TRY_ANOTHER_CARD
-                    )
-                    _state.value = TransactionState.Error(error)
-                    emitEvent(TransactionEvent.Failed(error))
-                }
+            // Check for cancellation before emitting results
+            if (isCancelled.get()) {
+                Timber.d("Transaction cancelled after processing, suppressing result events")
+                return TransactionOutcome.Error("Transaction cancelled")
             }
 
-            // Disconnect
-            try {
-                isoDep.close()
-            } catch (e: Exception) {
-                Timber.w(e, "Error closing IsoDep")
+            // Handle outcome - re-check isCancelled before each emission to prevent race
+            // where cancel() could be called between the check above and event emission
+            when (outcome) {
+                is TransactionOutcome.OnlineRequired -> {
+                    if (!isCancelled.get()) {
+                        _state.value = TransactionState.Complete(outcome)
+                        emitEvent(TransactionEvent.OnlineAuthRequired(outcome.authData))
+                    }
+                }
+                is TransactionOutcome.Approved -> {
+                    if (!isCancelled.get()) {
+                        _state.value = TransactionState.Complete(outcome)
+                        emitEvent(TransactionEvent.Completed(outcome))
+                    }
+                }
+                is TransactionOutcome.Declined -> {
+                    if (!isCancelled.get()) {
+                        _state.value = TransactionState.Complete(outcome)
+                        emitEvent(TransactionEvent.Completed(outcome))
+                    }
+                }
+                is TransactionOutcome.Error -> {
+                    if (!isCancelled.get()) {
+                        val error = ErrorInfo(
+                            category = ErrorCategory.PROCESSING_ERROR,
+                            message = outcome.reason,
+                            isRetryable = false,
+                            canRetryManually = true,
+                            userMessage = outcome.reason,
+                            recoveryAction = RecoveryAction.RESTART_TRANSACTION
+                        )
+                        _state.value = TransactionState.Error(error)
+                        emitEvent(TransactionEvent.Failed(error))
+                    }
+                }
+                is TransactionOutcome.TryAnotherInterface -> {
+                    if (!isCancelled.get()) {
+                        val error = ErrorInfo(
+                            category = ErrorCategory.CARD_NOT_SUPPORTED,
+                            message = "Card requires insert or swipe",
+                            isRetryable = false,
+                            canRetryManually = false,
+                            userMessage = "Please insert or swipe this card",
+                            recoveryAction = RecoveryAction.TRY_ANOTHER_CARD
+                        )
+                        _state.value = TransactionState.Error(error)
+                        emitEvent(TransactionEvent.Failed(error))
+                    }
+                }
             }
 
             return outcome
 
         } finally {
+            // Always close IsoDep connection
+            try {
+                isoDep?.close()
+            } catch (e: Exception) {
+                Timber.w(e, "Error closing IsoDep")
+            }
+            currentJob.set(null)
             isProcessing.set(false)
+
+            // Transition from Cancelling to Idle now that cleanup is complete
+            if (isCancelled.get() && _state.value is TransactionState.Cancelling) {
+                _state.value = TransactionState.Idle
+                Timber.d("Transaction cancellation complete, now Idle")
+            }
         }
     }
 
     /**
      * Cancel current transaction
+     *
+     * If called on a transaction started via startTransactionAsync(), cancels the job.
+     * If called on a transaction started via startTransaction(), sets cancellation flag
+     * that will be checked at safe points (caller's coroutine is not affected).
+     *
+     * Note: isProcessing is NOT cleared here - it's cleared in the finally block of
+     * startTransaction() to prevent race conditions where a new transaction could
+     * start before the current one fully completes.
      */
     fun cancel() {
-        currentJob?.cancel()
-        _state.value = TransactionState.Idle
-        isProcessing.set(false)
+        // Set cancellation flag for transactions started via startTransaction()
+        isCancelled.set(true)
+
+        // Cancel job only if we own it (from startTransactionAsync)
+        val job = currentJob.getAndSet(null)
+        job?.cancel()
+
+        // Set to Cancelling state - will transition to Idle in finally block
+        // This ensures UI shows accurate state while cleanup completes
+        _state.value = TransactionState.Cancelling
+        // Note: Do NOT set isProcessing to false here - let the finally block handle it
+        // to prevent a new transaction from starting while the old one is still cleaning up
+        Timber.d("Transaction cancellation requested")
+    }
+
+    /**
+     * Check if transaction has been cancelled
+     * Call this at safe cancellation points in long-running operations
+     */
+    fun isCancelled(): Boolean = isCancelled.get()
+
+    /**
+     * Clean up resources when coordinator is no longer needed
+     */
+    fun destroy() {
+        cancel()
+        transactionScope.cancel()
     }
 
     /**
@@ -548,6 +647,7 @@ data class TransactionCoordinatorConfig(
 
 sealed class TransactionState {
     object Idle : TransactionState()
+    object Cancelling : TransactionState()
     data class Processing(val message: String) : TransactionState()
     data class PinRequired(val pan: String, val amount: Long) : TransactionState()
     data class Complete(val outcome: TransactionOutcome) : TransactionState()

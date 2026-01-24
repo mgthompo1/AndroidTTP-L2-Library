@@ -61,41 +61,122 @@ object EmvCrypto {
     }
 
     /**
-     * Verify RSA signature
+     * Verify RSA signature per EMV Book 2 specifications
+     *
+     * EMV recovered data format (ISO/IEC 9796-2 with message recovery):
+     * - Header: 0x6A (indicates partial recovery)
+     * - Format byte: Varies by signature type
+     * - Padding: 0xBB bytes (if needed for alignment)
+     * - Data: Certificate/signed data content
+     * - Hash Algorithm Indicator: 0x01=SHA-1, 0x02=SHA-256 (optional in some formats)
+     * - Hash: SHA-1 (20 bytes) or SHA-256 (32 bytes)
+     * - Trailer: 0xBC
+     *
+     * @param data The data that was signed (for hash comparison)
+     * @param signature The signature to verify
+     * @param modulus RSA public key modulus
+     * @param exponent RSA public key exponent
+     * @param hashAlgorithm Hash algorithm used (SHA1 or SHA256)
+     * @param signatureType Type of EMV signature for format byte validation
+     * @return true if signature is valid, false otherwise
      */
     fun rsaVerify(
         data: ByteArray,
         signature: ByteArray,
         modulus: ByteArray,
         exponent: ByteArray,
-        hashAlgorithm: HashAlgorithm = HashAlgorithm.SHA1
+        hashAlgorithm: HashAlgorithm = HashAlgorithm.SHA1,
+        signatureType: EmvSignatureType = EmvSignatureType.CERTIFICATE
     ): Boolean {
+        // Recover plaintext from signature
         val recovered = rsaRecover(signature, modulus, exponent)
-        val expectedHash = hash(data, hashAlgorithm)
 
-        // Check recovered data format and extract hash
-        // EMV format: 6A || data || hash || BC
-        if (recovered.isEmpty()) return false
+        if (recovered.isEmpty()) {
+            return false
+        }
 
         val hashLength = when (hashAlgorithm) {
             HashAlgorithm.SHA1 -> 20
             HashAlgorithm.SHA256 -> 32
         }
 
-        if (recovered.size < hashLength + 2) return false
-
-        // Extract hash from recovered data (last hashLength bytes before trailer)
-        val trailerIndex = recovered.size - 1
-        if (recovered[trailerIndex] != 0xBC.toByte()) {
-            // Try without trailer check for some certificate formats
+        // Minimum size: header (1) + format (1) + at least 1 byte data + hash + trailer (1)
+        if (recovered.size < hashLength + 4) {
+            return false
         }
 
-        val recoveredHash = recovered.copyOfRange(
-            recovered.size - hashLength - 1,
-            recovered.size - 1
-        )
+        // EMV Book 2: Verify header byte is 0x6A (partial recovery mode)
+        if (recovered[0] != 0x6A.toByte()) {
+            return false
+        }
 
-        return recoveredHash.contentEquals(expectedHash)
+        // EMV Book 2: Verify trailer byte is 0xBC
+        val trailerIndex = recovered.size - 1
+        if (recovered[trailerIndex] != 0xBC.toByte()) {
+            return false
+        }
+
+        // Verify format byte based on signature type
+        val formatByte = recovered[1].toInt() and 0xFF
+        if (!signatureType.isValidFormat(formatByte)) {
+            return false
+        }
+
+        // Validate padding bytes (0xBB) if present - they should appear after format
+        // and continue until non-0xBB data is encountered
+        var dataStartIndex = 2
+        while (dataStartIndex < recovered.size - hashLength - 1 &&
+               recovered[dataStartIndex] == 0xBB.toByte()) {
+            dataStartIndex++
+        }
+
+        // Extract hash from recovered data (last hashLength bytes before trailer)
+        val hashStartIndex = recovered.size - 1 - hashLength
+        if (hashStartIndex < dataStartIndex) {
+            return false
+        }
+
+        val recoveredHash = recovered.copyOfRange(hashStartIndex, hashStartIndex + hashLength)
+
+        // Compute expected hash over the data
+        val expectedHash = hash(data, hashAlgorithm)
+
+        // Constant-time comparison to prevent timing attacks
+        return constantTimeEquals(recoveredHash, expectedHash)
+    }
+
+    /**
+     * EMV signature types with their valid format bytes
+     */
+    enum class EmvSignatureType(private val validFormats: Set<Int>) {
+        /** CA, Issuer, ICC Public Key Certificates */
+        CERTIFICATE(setOf(0x02, 0x04, 0x12, 0x14)),
+
+        /** Signed Static Application Data (SDA) */
+        SIGNED_STATIC_DATA(setOf(0x03, 0x93)),
+
+        /** Signed Dynamic Application Data (DDA/CDA) */
+        SIGNED_DYNAMIC_DATA(setOf(0x05, 0x95)),
+
+        /** Any format byte accepted (for testing or unknown types) */
+        ANY(emptySet());
+
+        fun isValidFormat(format: Int): Boolean {
+            return this == ANY || format in validFormats
+        }
+    }
+
+    /**
+     * Constant-time byte array comparison to prevent timing attacks
+     */
+    private fun constantTimeEquals(a: ByteArray, b: ByteArray): Boolean {
+        if (a.size != b.size) return false
+
+        var result = 0
+        for (i in a.indices) {
+            result = result or (a[i].toInt() xor b[i].toInt())
+        }
+        return result == 0
     }
 
     /**

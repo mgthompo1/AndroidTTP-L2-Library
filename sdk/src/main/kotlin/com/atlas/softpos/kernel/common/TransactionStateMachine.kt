@@ -219,8 +219,9 @@ class TransactionStateMachine {
 
     /**
      * Cancel the current transaction
+     * Uses mutex to prevent race conditions with state transitions
      */
-    suspend fun cancel(): Result<Unit> {
+    suspend fun cancel(): Result<Unit> = mutex.withLock {
         val current = currentState.get()
         if (current == TransactionState.IDLE) {
             return Result.success(Unit)

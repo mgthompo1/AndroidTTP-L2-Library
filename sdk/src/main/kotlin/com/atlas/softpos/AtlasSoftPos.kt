@@ -29,8 +29,11 @@ import com.atlas.softpos.kernel.unionpay.UnionPayKernelResult
 import com.atlas.softpos.kernel.unionpay.UnionPayTransaction
 import com.atlas.softpos.nfc.NfcCardReader
 import com.atlas.softpos.nfc.NfcStatus
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import timber.log.Timber
@@ -168,6 +171,8 @@ class AtlasSoftPos private constructor(
     // Transaction state
     private var isTransactionInProgress = false
     private var currentTransactionCallback: TransactionCallback? = null
+    private var currentTransactionJob: Job? = null
+    private val transactionScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     /**
      * Check NFC availability
@@ -238,10 +243,23 @@ class AtlasSoftPos private constructor(
      * Cancel the current transaction
      */
     fun cancelTransaction() {
+        // Cancel any in-flight transaction processing
+        currentTransactionJob?.cancel()
+        currentTransactionJob = null
+
         nfcReader.stopReading()
         isTransactionInProgress = false
         currentTransactionCallback?.onCancelled()
         currentTransactionCallback = null
+    }
+
+    /**
+     * Clean up resources when SDK is no longer needed
+     * Call this when the Activity is destroyed
+     */
+    fun destroy() {
+        cancelTransaction()
+        transactionScope.cancel()
     }
 
     /**
@@ -277,19 +295,24 @@ class AtlasSoftPos private constructor(
         cashbackAmount: Long?,
         callback: TransactionCallback
     ) {
-        GlobalScope.launch(Dispatchers.Main) {
+        currentTransactionJob = transactionScope.launch {
             try {
                 val result = withContext(Dispatchers.IO) {
                     processTransaction(tag, amount, type, cashbackAmount)
                 }
                 isTransactionInProgress = false
                 callback.onResult(result)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // Transaction was cancelled - don't report as error
+                Timber.d("Transaction cancelled")
+                throw e
             } catch (e: Exception) {
                 isTransactionInProgress = false
                 Timber.e(e, "Transaction processing error")
                 callback.onError(TransactionError.ProcessingError(e.message ?: "Unknown error"))
             } finally {
                 nfcReader.stopReading()
+                currentTransactionJob = null
             }
         }
     }

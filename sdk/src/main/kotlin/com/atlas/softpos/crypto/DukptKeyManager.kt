@@ -48,6 +48,9 @@ class DukptKeyManager(
     // Flag indicating if initialized
     private var initialized = false
 
+    // Flag indicating if destroyed
+    private var destroyed = false
+
     /**
      * Initialize DUKPT with IPEK (Initial PIN Encryption Key)
      *
@@ -78,8 +81,13 @@ class DukptKeyManager(
      * @throws IllegalStateException if no more keys available
      */
     fun getNextKey(): DukptKeyResult {
+        check(!destroyed) { "DUKPT manager has been destroyed" }
         check(initialized) { "DUKPT not initialized" }
         check(transactionCounter < MAX_TRANSACTION_COUNT) { "DUKPT exhausted - reinject required" }
+
+        // Clear previous current key if exists
+        currentKey?.let { secureZero(it) }
+        currentKey = null
 
         // Find next valid counter (skip counters with more than 10 one-bits)
         while (countOneBits(transactionCounter) > 10 && transactionCounter < MAX_TRANSACTION_COUNT) {
@@ -96,20 +104,58 @@ class DukptKeyManager(
         // Build current KSN
         val currentKsn = buildKsn(transactionCounter)
 
-        // Derive PIN encryption key variant
-        val pinKey = derivePinEncryptionKey(currentKey!!)
+        // Derive key variant based on configuration
+        val derivedKey = deriveKeyVariant(currentKey!!, config.keyVariant)
 
         // Increment counter for next transaction
         transactionCounter++
+
+        // Update future keys (requires currentKey to still be valid)
         updateFutureKeys()
 
-        Timber.d("DUKPT key derived, remaining=${MAX_TRANSACTION_COUNT - transactionCounter}")
+        // NOW clear the session key from memory after future keys are updated
+        currentKey?.let { secureZero(it) }
+        currentKey = null
+
+        Timber.d("DUKPT key derived (${config.keyVariant}), remaining=${MAX_TRANSACTION_COUNT - transactionCounter}")
 
         return DukptKeyResult(
-            pinEncryptionKey = pinKey,
+            pinEncryptionKey = derivedKey,
             ksn = currentKsn,
             remainingKeys = MAX_TRANSACTION_COUNT - transactionCounter
         )
+    }
+
+    /**
+     * Securely zero a byte array to clear sensitive key material from memory
+     */
+    private fun secureZero(array: ByteArray) {
+        array.fill(0)
+    }
+
+    /**
+     * Destroy the DUKPT manager, clearing all key material from memory
+     * Call this when the manager is no longer needed
+     */
+    fun destroy() {
+        if (destroyed) return
+        destroyed = true
+
+        // Clear current key
+        currentKey?.let { secureZero(it) }
+        currentKey = null
+
+        // Clear all future keys
+        for (i in futureKeys.indices) {
+            futureKeys[i]?.let { secureZero(it) }
+            futureKeys[i] = null
+        }
+
+        // Clear KSN
+        secureZero(ksn)
+
+        initialized = false
+        Timber.d("DUKPT manager destroyed, all keys cleared")
     }
 
     /**
@@ -198,11 +244,15 @@ class DukptKeyManager(
         val newBit = findLowestSetBit(changed and transactionCounter)
 
         if (newBit >= 0 && currentKey != null) {
+            // Clear old key at this position before overwriting
+            futureKeys[newBit]?.let { secureZero(it) }
+
             // Store derived key for this new bit position
             futureKeys[newBit] = deriveFutureKey(currentKey!!, 1 shl newBit)
 
-            // Clear keys for lower bits (they'll be re-derived)
+            // Securely clear keys for lower bits (they'll be re-derived)
             for (i in 0 until newBit) {
+                futureKeys[i]?.let { secureZero(it) }
                 futureKeys[i] = null
             }
         }
@@ -253,13 +303,67 @@ class DukptKeyManager(
     }
 
     /**
-     * Derive PIN Encryption Key variant from session key
+     * Derive key variant from session key
      *
-     * Per ANSI X9.24, XOR with PIN variant constant
+     * Per ANSI X9.24, XOR with appropriate variant constant
      */
-    private fun derivePinEncryptionKey(sessionKey: ByteArray): ByteArray {
-        val pinVariant = PIN_VARIANT_CONSTANT
-        return xorBytes(sessionKey, pinVariant)
+    private fun deriveKeyVariant(sessionKey: ByteArray, variant: KeyVariant): ByteArray {
+        val variantConstant = when (variant) {
+            KeyVariant.PIN -> PIN_VARIANT_CONSTANT
+            KeyVariant.MAC -> MAC_VARIANT_CONSTANT
+            KeyVariant.DATA -> DATA_VARIANT_CONSTANT
+        }
+        return xorBytes(sessionKey, variantConstant)
+    }
+
+    /**
+     * Get a key for a specific variant (convenience method)
+     * Creates a new key derivation for the requested variant
+     */
+    fun getNextKeyForVariant(variant: KeyVariant): DukptKeyResult {
+        check(!destroyed) { "DUKPT manager has been destroyed" }
+        check(initialized) { "DUKPT not initialized" }
+        check(transactionCounter < MAX_TRANSACTION_COUNT) { "DUKPT exhausted - reinject required" }
+
+        // Clear previous current key if exists
+        currentKey?.let { secureZero(it) }
+        currentKey = null
+
+        // Find next valid counter
+        while (countOneBits(transactionCounter) > 10 && transactionCounter < MAX_TRANSACTION_COUNT) {
+            transactionCounter++
+        }
+
+        if (transactionCounter >= MAX_TRANSACTION_COUNT) {
+            throw IllegalStateException("DUKPT exhausted - reinject required")
+        }
+
+        // Derive current key from future keys
+        currentKey = deriveCurrentKey(transactionCounter)
+
+        // Build current KSN
+        val currentKsn = buildKsn(transactionCounter)
+
+        // Derive requested key variant
+        val derivedKey = deriveKeyVariant(currentKey!!, variant)
+
+        // Increment counter for next transaction
+        transactionCounter++
+
+        // Update future keys (requires currentKey to still be valid)
+        updateFutureKeys()
+
+        // Clear the session key from memory
+        currentKey?.let { secureZero(it) }
+        currentKey = null
+
+        Timber.d("DUKPT key derived ($variant), remaining=${MAX_TRANSACTION_COUNT - transactionCounter}")
+
+        return DukptKeyResult(
+            pinEncryptionKey = derivedKey,
+            ksn = currentKsn,
+            remainingKeys = MAX_TRANSACTION_COUNT - transactionCounter
+        )
     }
 
     /**
@@ -438,12 +542,23 @@ enum class KeyVariant {
 
 /**
  * Result of DUKPT key derivation
+ *
+ * SECURITY NOTE: The caller MUST call clear() on this result after
+ * using the pinEncryptionKey to prevent key material from remaining in memory.
  */
 data class DukptKeyResult(
     val pinEncryptionKey: ByteArray,
     val ksn: ByteArray,
     val remainingKeys: Int
 ) {
+    /**
+     * Securely clear the PIN encryption key from memory
+     * Call this after the key has been used
+     */
+    fun clear() {
+        pinEncryptionKey.fill(0)
+    }
+
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is DukptKeyResult) return false

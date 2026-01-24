@@ -78,7 +78,8 @@ class OnlinePinEntry(
         onResult: (OnlinePinResult) -> Unit,
         onDismiss: () -> Unit
     ) {
-        var pinDigits by remember { mutableStateOf("") }
+        // Use CharArray for secure PIN storage - can be reliably cleared from memory
+        var pinDigits by remember { mutableStateOf(CharArray(0)) }
         var attempts by remember { mutableStateOf(0) }
         var isProcessing by remember { mutableStateOf(false) }
         var errorMessage by remember { mutableStateOf<String?>(null) }
@@ -88,12 +89,18 @@ class OnlinePinEntry(
         val context = LocalContext.current
         val view = LocalView.current
 
+        // Helper to safely clear and update PIN
+        fun clearPinDigits() {
+            pinDigits.fill('\u0000')
+            pinDigits = CharArray(0)
+        }
+
         // Auto-clear PIN after timeout
-        LaunchedEffect(pinDigits) {
+        LaunchedEffect(pinDigits.size) {
             if (pinDigits.isNotEmpty()) {
                 delay(config.pinTimeoutMs)
                 if (pinDigits.isNotEmpty()) {
-                    pinDigits = ""
+                    clearPinDigits()
                     errorMessage = "PIN entry timed out"
                 }
             }
@@ -113,7 +120,7 @@ class OnlinePinEntry(
 
         Dialog(
             onDismissRequest = {
-                clearPinFromMemory(pinDigits)
+                clearPinDigits()
                 onDismiss()
             },
             properties = DialogProperties(
@@ -166,7 +173,7 @@ class OnlinePinEntry(
 
                     // PIN dots display
                     PinDotsDisplay(
-                        length = pinDigits.length,
+                        length = pinDigits.size,
                         maxLength = config.maxPinLength,
                         hasError = errorMessage != null
                     )
@@ -186,23 +193,32 @@ class OnlinePinEntry(
                     // Numeric keypad
                     NumericKeypad(
                         layout = keypadLayout,
-                        enabled = !isProcessing && pinDigits.length < config.maxPinLength,
+                        enabled = !isProcessing && pinDigits.size < config.maxPinLength,
                         onDigitPressed = { digit ->
                             errorMessage = null
                             haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            if (pinDigits.length < config.maxPinLength) {
-                                pinDigits += digit
+                            if (pinDigits.size < config.maxPinLength) {
+                                // Append digit to CharArray securely
+                                val newPin = CharArray(pinDigits.size + 1)
+                                pinDigits.copyInto(newPin)
+                                newPin[pinDigits.size] = digit[0]
+                                pinDigits.fill('\u0000')  // Clear old array
+                                pinDigits = newPin
                             }
                         },
                         onBackspace = {
                             haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                             if (pinDigits.isNotEmpty()) {
-                                pinDigits = pinDigits.dropLast(1)
+                                // Remove last digit securely
+                                val newPin = CharArray(pinDigits.size - 1)
+                                pinDigits.copyInto(newPin, endIndex = pinDigits.size - 1)
+                                pinDigits.fill('\u0000')  // Clear old array
+                                pinDigits = newPin
                             }
                         },
                         onClear = {
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                            pinDigits = ""
+                            clearPinDigits()
                             errorMessage = null
                         }
                     )
@@ -217,7 +233,7 @@ class OnlinePinEntry(
                         // Cancel button
                         OutlinedButton(
                             onClick = {
-                                clearPinFromMemory(pinDigits)
+                                clearPinDigits()
                                 onResult(OnlinePinResult.Cancelled)
                             },
                             modifier = Modifier.weight(1f),
@@ -229,7 +245,7 @@ class OnlinePinEntry(
                         // Confirm button
                         Button(
                             onClick = {
-                                if (pinDigits.length >= config.minPinLength) {
+                                if (pinDigits.size >= config.minPinLength) {
                                     isProcessing = true
 
                                     try {
@@ -245,8 +261,7 @@ class OnlinePinEntry(
                                             useAes = config.pinBlockFormat == PinBlockFormat.ISO_FORMAT_4
                                         )
 
-                                        clearPinFromMemory(pinDigits)
-                                        pinDigits = ""
+                                        clearPinDigits()
 
                                         onResult(OnlinePinResult.Success(
                                             encryptedPinBlock = encryptedPinBlock,
@@ -259,11 +274,11 @@ class OnlinePinEntry(
                                         isProcessing = false
 
                                         if (attempts >= config.maxAttempts) {
-                                            clearPinFromMemory(pinDigits)
+                                            clearPinDigits()
                                             onResult(OnlinePinResult.MaxAttemptsExceeded)
                                         } else {
                                             errorMessage = "PIN processing failed. Try again."
-                                            pinDigits = ""
+                                            clearPinDigits()
                                             if (config.randomizeKeypad) {
                                                 keypadLayout = generateKeypadLayout(true)
                                             }
@@ -274,7 +289,7 @@ class OnlinePinEntry(
                                 }
                             },
                             modifier = Modifier.weight(1f),
-                            enabled = !isProcessing && pinDigits.length >= config.minPinLength
+                            enabled = !isProcessing && pinDigits.size >= config.minPinLength
                         ) {
                             if (isProcessing) {
                                 CircularProgressIndicator(
@@ -293,7 +308,7 @@ class OnlinePinEntry(
                         Spacer(modifier = Modifier.height(12.dp))
                         TextButton(
                             onClick = {
-                                clearPinFromMemory(pinDigits)
+                                clearPinDigits()
                                 onResult(OnlinePinResult.Bypassed)
                             },
                             enabled = !isProcessing
@@ -420,8 +435,9 @@ class OnlinePinEntry(
 
     /**
      * Build PIN Block according to specified format
+     * Uses CharArray for secure PIN handling
      */
-    private fun buildPinBlock(pin: String, pan: String, format: PinBlockFormat): ByteArray {
+    private fun buildPinBlock(pin: CharArray, pan: String, format: PinBlockFormat): ByteArray {
         return when (format) {
             PinBlockFormat.ISO_FORMAT_0 -> buildIsoFormat0PinBlock(pin, pan)
             PinBlockFormat.ISO_FORMAT_4 -> buildIsoFormat4PinBlock(pin, pan)
@@ -437,14 +453,21 @@ class OnlinePinEntry(
      * PIN Field: 0 | PIN Length | PIN | F padding
      * PAN Field: 0000 | 12 rightmost digits of PAN (excluding check digit)
      */
-    private fun buildIsoFormat0PinBlock(pin: String, pan: String): ByteArray {
+    private fun buildIsoFormat0PinBlock(pin: CharArray, pan: String): ByteArray {
         // Build PIN field: 0 | length | PIN | F padding
-        val pinField = StringBuilder()
-        pinField.append("0")
-        pinField.append(pin.length.toString(16).uppercase())
-        pinField.append(pin)
-        while (pinField.length < 16) {
-            pinField.append("F")
+        // Use CharArray to avoid String intermediates
+        val pinField = CharArray(16)
+        pinField[0] = '0'
+        pinField[1] = pin.size.toString(16).uppercase()[0]
+
+        // Copy PIN digits
+        for (i in pin.indices) {
+            pinField[2 + i] = pin[i]
+        }
+
+        // Fill remaining with 'F'
+        for (i in (2 + pin.size) until 16) {
+            pinField[i] = 'F'
         }
 
         // Build PAN field: 0000 | 12 rightmost digits (excluding check digit)
@@ -456,9 +479,18 @@ class OnlinePinEntry(
         }
         val panField = "0000$panForBlock"
 
-        // XOR the fields
-        val pinBytes = pinField.toString().chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        // Convert to bytes and XOR
+        val pinBytes = ByteArray(8)
+        for (i in 0 until 8) {
+            val high = Character.digit(pinField[i * 2], 16)
+            val low = Character.digit(pinField[i * 2 + 1], 16)
+            pinBytes[i] = ((high shl 4) or low).toByte()
+        }
+
         val panBytes = panField.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+
+        // Clear the PIN field from memory
+        pinField.fill('\u0000')
 
         return ByteArray(8) { i ->
             (pinBytes[i].toInt() xor panBytes[i].toInt()).toByte()
@@ -468,26 +500,41 @@ class OnlinePinEntry(
     /**
      * ISO 9564-1 Format 4 (AES-based)
      */
-    private fun buildIsoFormat4PinBlock(pin: String, pan: String): ByteArray {
+    private fun buildIsoFormat4PinBlock(pin: CharArray, pan: String): ByteArray {
         // Format 4 uses a different structure for AES
-        val pinField = StringBuilder()
-        pinField.append("4")  // Format code
-        pinField.append(pin.length.toString(16).uppercase())
-        pinField.append(pin)
+        val pinField = CharArray(32)
+        pinField[0] = '4'  // Format code
+        pinField[1] = pin.size.toString(16).uppercase()[0]
+
+        // Copy PIN digits
+        for (i in pin.indices) {
+            pinField[2 + i] = pin[i]
+        }
 
         // Pad with random digits
         val random = SecureRandom()
-        while (pinField.length < 32) {
-            pinField.append(random.nextInt(10).toString())
+        for (i in (2 + pin.size) until 32) {
+            pinField[i] = ('0' + random.nextInt(10))
         }
 
-        return pinField.toString().chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        // Convert to bytes
+        val result = ByteArray(16)
+        for (i in 0 until 16) {
+            val high = Character.digit(pinField[i * 2], 16)
+            val low = Character.digit(pinField[i * 2 + 1], 16)
+            result[i] = ((high shl 4) or low).toByte()
+        }
+
+        // Clear the PIN field from memory
+        pinField.fill('\u0000')
+
+        return result
     }
 
     /**
      * Visa PIN Block format
      */
-    private fun buildVisaPinBlock(pin: String, pan: String): ByteArray {
+    private fun buildVisaPinBlock(pin: CharArray, pan: String): ByteArray {
         // Visa typically uses ISO Format 0
         return buildIsoFormat0PinBlock(pin, pan)
     }
@@ -544,22 +591,6 @@ class OnlinePinEntry(
         return "**** **** **** ${cleanPan.takeLast(4)}"
     }
 
-    /**
-     * Securely clear PIN from memory
-     */
-    private fun clearPinFromMemory(pin: String) {
-        // Note: String is immutable in Kotlin/Java, so we can't truly clear it
-        // In production, use CharArray and clear each element
-        // This is a best-effort approach
-        try {
-            val field = String::class.java.getDeclaredField("value")
-            field.isAccessible = true
-            val chars = field.get(pin) as? CharArray
-            chars?.fill('\u0000')
-        } catch (e: Exception) {
-            // Ignore - some JVM implementations may not allow this
-        }
-    }
 }
 
 /**
