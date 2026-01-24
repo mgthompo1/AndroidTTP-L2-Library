@@ -9,6 +9,9 @@ import com.atlas.softpos.core.tlv.TlvTag
 import com.atlas.softpos.crypto.OfflineDataAuthentication
 import com.atlas.softpos.crypto.OdaResult
 import com.atlas.softpos.crypto.StandaloneOdaProcessor
+import com.atlas.softpos.crypto.IssuerScriptAuthenticator
+import com.atlas.softpos.crypto.IssuerScriptProcessor
+import com.atlas.softpos.crypto.IssuerScripts
 import com.atlas.softpos.kernel.common.CardTransceiver
 import com.atlas.softpos.kernel.common.SelectedApplication
 import com.atlas.softpos.kernel.common.TerminalVerificationResults
@@ -138,20 +141,17 @@ class MastercardContactlessKernel(
         Timber.d("Processing online response: approved=${onlineResponse.approved}")
 
         try {
-            // Step 1: Verify ARPC if provided
-            if (onlineResponse.arpc != null && onlineResponse.arc != null) {
-                val arpcValid = verifyArpc(
-                    arqc = previousAuthData.applicationCryptogram.hexToByteArray(),
-                    arpc = onlineResponse.arpc,
-                    arc = onlineResponse.arc,
-                    sessionKey = deriveSessionKeyFromCardData()
-                )
-
-                if (!arpcValid) {
-                    Timber.w("ARPC verification failed")
-                    tvr.issuerAuthFailed = true
-                    // Continue - card will decide based on IAC
-                }
+            // Step 1: Prepare Issuer Authentication Data (Tag 91) for card verification
+            // Note: Terminal does NOT verify ARPC locally - the card does during second GENERATE AC
+            val issuerAuthData = buildIssuerAuthData(onlineResponse.arpc, onlineResponse.arc)
+            if (issuerAuthData != null) {
+                // Store Tag 91 in terminalData for CDOL2 building
+                terminalData.set(0x91, issuerAuthData)
+                Timber.d("Issuer auth data (Tag 91) prepared for second GENERATE AC")
+            } else if (onlineResponse.arpc != null) {
+                // ARPC provided but couldn't build Tag 91 - set TVR flag
+                tvr.issuerAuthFailed = true
+                Timber.w("Could not build issuer auth data from ARPC/ARC")
             }
 
             // Step 2: Process issuer scripts before GENERATE AC (tag 71)
@@ -210,32 +210,48 @@ class MastercardContactlessKernel(
     }
 
     /**
-     * Verify Authorization Response Cryptogram (ARPC)
-     * Supports Method 1 (MAC-based) and Method 2 (proprietary)
+     * Build Issuer Authentication Data (Tag 91) for second GENERATE AC
+     *
+     * Per EMV Book 2: The terminal does NOT verify ARPC locally - it passes
+     * the Issuer Authentication Data to the card. The card verifies ARPC
+     * using its internal keys and returns TC (approved) or AAC (declined).
+     *
+     * Tag 91 Format (Method 1): ARPC (8 bytes) || ARC (2 bytes)
+     * Tag 91 Format (Method 2): ARPC (4 bytes) || CSU (4 bytes) || Prop Data
+     *
+     * @param arpc ARPC from issuer
+     * @param arc Authorization Response Code (2 bytes)
+     * @return Tag 91 data to include in CDOL2, or null if data is invalid
      */
-    private fun verifyArpc(
-        arqc: ByteArray,
-        arpc: ByteArray,
-        arc: ByteArray,
-        sessionKey: ByteArray?
-    ): Boolean {
-        if (sessionKey == null) {
-            Timber.w("Cannot verify ARPC: no session key available")
-            return false
+    private fun buildIssuerAuthData(arpc: ByteArray?, arc: ByteArray?): ByteArray? {
+        if (arpc == null || arc == null) {
+            Timber.d("No issuer auth data available")
+            return null
         }
 
-        // Method 1: ARPC = MAC(ARQC XOR (ARC || 0000 0000 0000))
-        val arcPadded = ByteArray(8)
-        System.arraycopy(arc, 0, arcPadded, 0, minOf(arc.size, 2))
-
-        val xored = ByteArray(8)
-        for (i in 0 until 8) {
-            xored[i] = (arqc[i].toInt() xor arcPadded[i].toInt()).toByte()
+        // Method 1: ARPC (8) || ARC (2)
+        if (arpc.size == 8 && arc.size == 2) {
+            val issuerAuthData = ByteArray(10)
+            System.arraycopy(arpc, 0, issuerAuthData, 0, 8)
+            System.arraycopy(arc, 0, issuerAuthData, 8, 2)
+            Timber.d("Built Tag 91 issuer auth data (Method 1): ${issuerAuthData.toHexString()}")
+            return issuerAuthData
         }
 
-        val expectedArpc = com.atlas.softpos.crypto.EmvCrypto.retailMac(xored, sessionKey)
-        return arpc.contentEquals(expectedArpc)
+        // Method 2: ARPC (4) || CSU (4) - ARC is CSU in this case
+        if (arpc.size == 4 && arc.size >= 4) {
+            val issuerAuthData = ByteArray(8)
+            System.arraycopy(arpc, 0, issuerAuthData, 0, 4)
+            System.arraycopy(arc, 0, issuerAuthData, 4, 4)
+            Timber.d("Built Tag 91 issuer auth data (Method 2): ${issuerAuthData.toHexString()}")
+            return issuerAuthData
+        }
+
+        Timber.w("Invalid ARPC/ARC sizes: ARPC=${arpc.size}, ARC=${arc.size}")
+        return null
     }
+
+    private fun ByteArray.toHexString(): String = joinToString("") { "%02X".format(it) }
 
     /**
      * Execute an issuer script command
@@ -351,19 +367,19 @@ class MastercardContactlessKernel(
     }
 
     /**
-     * Derive session key from card data for ARPC verification
+     * Create IssuerScripts object from online response for script processing
      */
-    private fun deriveSessionKeyFromCardData(): ByteArray? {
-        // In production, this would derive the session key using the ICC Master Key
-        // and Application Transaction Counter (ATC)
-        // For now, return null to indicate ARPC verification is not available
-        // without proper key management infrastructure
-        val atc = cardData[0x9F36] ?: return null
-
-        // This is a placeholder - actual implementation requires ICC Master Key
-        // which is derived from Issuer Master Key during personalization
-        Timber.d("Session key derivation requires ICC Master Key infrastructure")
-        return null
+    private fun createIssuerScripts(onlineResponse: OnlineAuthResponse): IssuerScripts {
+        return IssuerScripts(
+            script71 = onlineResponse.issuerScripts71?.let { scripts ->
+                scripts.fold(ByteArray(0)) { acc, script -> acc + script }
+            },
+            script72 = onlineResponse.issuerScripts72?.let { scripts ->
+                scripts.fold(ByteArray(0)) { acc, script -> acc + script }
+            },
+            issuerAuthData = onlineResponse.issuerAuthData,
+            arc = onlineResponse.arc
+        )
     }
 
     /**

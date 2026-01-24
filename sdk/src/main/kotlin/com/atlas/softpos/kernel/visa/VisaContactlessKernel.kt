@@ -14,6 +14,9 @@ import com.atlas.softpos.crypto.OfflineDataAuthentication
 import com.atlas.softpos.crypto.OdaResult
 import com.atlas.softpos.crypto.OdaFailureReason
 import com.atlas.softpos.crypto.StandaloneOdaProcessor
+import com.atlas.softpos.crypto.IssuerScriptAuthenticator
+import com.atlas.softpos.crypto.IssuerScriptProcessor
+import com.atlas.softpos.crypto.IssuerScripts
 import com.atlas.softpos.kernel.common.*
 import com.atlas.softpos.security.SecureMemory
 import timber.log.Timber
@@ -1212,19 +1215,17 @@ class VisaContactlessKernel(
         Timber.d("Online approved: ${onlineResponse.approved}")
 
         try {
-            // Step 1: Verify ARPC if provided
-            if (onlineResponse.arpc != null && onlineResponse.arc != null) {
-                val arpcValid = verifyArpc(
-                    arqc = previousAuthData.applicationCryptogram.hexToByteArray(),
-                    arpc = onlineResponse.arpc,
-                    arc = onlineResponse.arc
-                )
-
-                if (!arpcValid) {
-                    tvr.issuerAuthFailed = true
-                    Timber.w("ARPC verification failed")
-                    // Continue processing - card will decide final outcome
-                }
+            // Step 1: Prepare Issuer Authentication Data (Tag 91) for card verification
+            // Note: Terminal does NOT verify ARPC - the card does during second GENERATE AC
+            val issuerAuthData = buildIssuerAuthData(onlineResponse.arpc, onlineResponse.arc)
+            if (issuerAuthData != null) {
+                // Store Tag 91 in dataStore for CDOL2 building
+                dataStore.set(0x91, issuerAuthData)
+                Timber.d("Issuer auth data (Tag 91) prepared for second GENERATE AC")
+            } else if (onlineResponse.arpc != null) {
+                // ARPC provided but couldn't build Tag 91 - set TVR flag
+                tvr.issuerAuthFailed = true
+                Timber.w("Could not build issuer auth data from ARPC/ARC")
             }
 
             // Step 2: Execute issuer scripts before second GENERATE AC (tag 71)
@@ -1293,51 +1294,45 @@ class VisaContactlessKernel(
     }
 
     /**
-     * Verify ARPC (Authorization Response Cryptogram)
+     * Prepare Issuer Authentication Data (Tag 91) for second GENERATE AC
      *
-     * Visa uses ARPC Method 1:
-     * ARPC = DES3(ARQC XOR ARC || padding)
+     * Per EMV Book 2: The terminal does NOT verify ARPC locally - it passes
+     * the Issuer Authentication Data to the card. The card verifies ARPC
+     * using its internal keys and returns TC (approved) or AAC (declined).
      *
-     * The ARPC proves the issuer received and approved the ARQC.
+     * Tag 91 Format (Method 1): ARPC (8 bytes) || ARC (2 bytes)
+     * Tag 91 Format (Method 2): ARPC (4 bytes) || CSU (4 bytes) || Prop Data
+     *
+     * @param arpc ARPC from issuer (8 bytes for Method 1, 4 bytes for Method 2)
+     * @param arc Authorization Response Code (2 bytes)
+     * @return Tag 91 data to include in CDOL2, or null if data is invalid
      */
-    private fun verifyArpc(arqc: ByteArray, arpc: ByteArray, arc: ByteArray): Boolean {
-        Timber.d("Verifying ARPC")
-
-        // Get session key for verification
-        // In production, this would be derived from card-specific keys
-        val sessionKey = deriveSessionKeyFromCardData() ?: run {
-            Timber.w("Could not derive session key for ARPC verification")
-            return false
+    private fun buildIssuerAuthData(arpc: ByteArray?, arc: ByteArray?): ByteArray? {
+        if (arpc == null || arc == null) {
+            Timber.d("No issuer auth data available")
+            return null
         }
 
-        // ARPC Method 1 verification
-        // ARPC = 3DES_ENC(SK, ARQC XOR (ARC || 0x00000000))
-        val arcPadded = ByteArray(8)
-        System.arraycopy(arc, 0, arcPadded, 0, minOf(arc.size, 2))
-
-        val xorResult = ByteArray(8)
-        for (i in 0 until 8) {
-            xorResult[i] = (arqc.getOrElse(i) { 0 }.toInt() xor arcPadded[i].toInt()).toByte()
+        // Method 1: ARPC (8) || ARC (2)
+        if (arpc.size == 8 && arc.size == 2) {
+            val issuerAuthData = ByteArray(10)
+            System.arraycopy(arpc, 0, issuerAuthData, 0, 8)
+            System.arraycopy(arc, 0, issuerAuthData, 8, 2)
+            Timber.d("Built Tag 91 issuer auth data (Method 1): ${issuerAuthData.toHexString()}")
+            return issuerAuthData
         }
 
-        return try {
-            val cipher = javax.crypto.Cipher.getInstance("DESede/ECB/NoPadding")
-            val expandedKey = if (sessionKey.size == 16) {
-                sessionKey + sessionKey.copyOfRange(0, 8)
-            } else {
-                sessionKey
-            }
-            val keySpec = javax.crypto.spec.SecretKeySpec(expandedKey, "DESede")
-            cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, keySpec)
-            val computedArpc = cipher.doFinal(xorResult)
-
-            val matches = computedArpc.copyOfRange(0, arpc.size).contentEquals(arpc)
-            Timber.d("ARPC verification: ${if (matches) "PASSED" else "FAILED"}")
-            matches
-        } catch (e: Exception) {
-            Timber.e(e, "ARPC calculation error")
-            false
+        // Method 2: ARPC (4) || CSU (4) - ARC is CSU in this case
+        if (arpc.size == 4 && arc.size >= 4) {
+            val issuerAuthData = ByteArray(8)
+            System.arraycopy(arpc, 0, issuerAuthData, 0, 4)
+            System.arraycopy(arc, 0, issuerAuthData, 4, 4)
+            Timber.d("Built Tag 91 issuer auth data (Method 2): ${issuerAuthData.toHexString()}")
+            return issuerAuthData
         }
+
+        Timber.w("Invalid ARPC/ARC sizes: ARPC=${arpc.size}, ARC=${arc.size}")
+        return null
     }
 
     /**
@@ -1526,35 +1521,20 @@ class VisaContactlessKernel(
     }
 
     /**
-     * Derive session key from card data for ARPC verification
-     *
-     * Note: In production, this requires proper key management with
-     * derived session keys. This is a simplified implementation.
+     * Create IssuerScripts object from online response for script processing
      */
-    private fun deriveSessionKeyFromCardData(): ByteArray? {
-        // Session key derivation requires card master key and ATC
-        // This is typically handled by the issuer/acquirer HSM
-        // For local verification, we would need the card's UDK
-
-        val atc = cardData["9F36"]?.value
-        val pan = cardData["5A"]?.value
-        val psn = cardData["5F34"]?.value
-
-        if (atc == null || pan == null) {
-            return null
-        }
-
-        // Simplified key derivation - not cryptographically secure
-        // Production would use proper EMV session key derivation
-        Timber.w("Using simplified session key derivation - production should use proper key management")
-
-        val keyMaterial = ByteArray(16)
-        val panBytes = pan.copyOfRange(0, minOf(8, pan.size))
-        System.arraycopy(panBytes, 0, keyMaterial, 0, panBytes.size)
-        System.arraycopy(atc, 0, keyMaterial, 8, minOf(2, atc.size))
-        psn?.let { System.arraycopy(it, 0, keyMaterial, 10, minOf(1, it.size)) }
-
-        return keyMaterial
+    private fun createIssuerScripts(onlineResponse: VisaOnlineAuthResponse): IssuerScripts {
+        return IssuerScripts(
+            script71 = onlineResponse.issuerScripts71?.let { scripts ->
+                // Combine all script71 templates into one
+                scripts.fold(ByteArray(0)) { acc, script -> acc + script }
+            },
+            script72 = onlineResponse.issuerScripts72?.let { scripts ->
+                scripts.fold(ByteArray(0)) { acc, script -> acc + script }
+            },
+            issuerAuthData = onlineResponse.issuerAuthData,
+            arc = onlineResponse.arc
+        )
     }
 
     private fun String.hexToByteArray(): ByteArray {
