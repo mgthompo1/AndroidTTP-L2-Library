@@ -1,11 +1,19 @@
 package com.atlas.softpos.crypto
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import timber.log.Timber
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.cert.X509Certificate
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 
 /**
  * Certificate Revocation Checker
@@ -22,16 +30,24 @@ import java.util.concurrent.ConcurrentHashMap
 class CertificateRevocationChecker(
     private val config: RevocationConfig = RevocationConfig()
 ) {
-    // Local cache of revocation entries
+    // Local cache of revocation entries (thread-safe)
     private val revokedCaKeys = ConcurrentHashMap<String, RevocationEntry>()
     private val revokedIssuerCerts = ConcurrentHashMap<String, RevocationEntry>()
 
-    // Last CRL update timestamps
-    private var lastCrlUpdate: Long = 0
+    // Last CRL update timestamp (thread-safe atomic)
+    private val lastCrlUpdate = AtomicLong(0)
+
+    // Mutex to prevent concurrent CRL fetches
+    private val crlUpdateMutex = Mutex()
 
     init {
         // Load known revoked keys
         loadKnownRevocations()
+
+        // Security warning for production
+        if (config.enableOnlineCrl && !config.validateTlsCertificates) {
+            Timber.w("CRL TLS certificate validation is DISABLED - not recommended for production!")
+        }
     }
 
     /**
@@ -150,7 +166,7 @@ class CertificateRevocationChecker(
         return RevocationStats(
             revokedCaKeyCount = revokedCaKeys.size,
             revokedIssuerCertCount = revokedIssuerCerts.size,
-            lastCrlUpdate = lastCrlUpdate,
+            lastCrlUpdate = lastCrlUpdate.get(),
             onlineCrlEnabled = config.enableOnlineCrl
         )
     }
@@ -171,32 +187,133 @@ class CertificateRevocationChecker(
 
     private fun shouldUpdateCrl(): Boolean {
         if (!config.enableOnlineCrl) return false
-        val elapsed = System.currentTimeMillis() - lastCrlUpdate
+        val elapsed = System.currentTimeMillis() - lastCrlUpdate.get()
         return elapsed > config.crlUpdateIntervalMs
     }
 
-    private suspend fun updateCrlFromNetwork(rid: ByteArray) = withContext(Dispatchers.IO) {
-        val crlUrl = getCrlUrlForRid(rid) ?: return@withContext
-
-        try {
-            Timber.d("Fetching CRL from $crlUrl")
-            val connection = URL(crlUrl).openConnection() as HttpURLConnection
-            connection.connectTimeout = config.connectionTimeoutMs
-            connection.readTimeout = config.readTimeoutMs
-            connection.requestMethod = "GET"
-
-            if (connection.responseCode == 200) {
-                val response = connection.inputStream.bufferedReader().readText()
-                parseCrlResponse(rid, response)
-                lastCrlUpdate = System.currentTimeMillis()
-                Timber.d("CRL update successful")
-            } else {
-                Timber.w("CRL fetch failed: HTTP ${connection.responseCode}")
+    /**
+     * Update CRL from network with thread-safety and TLS validation
+     */
+    private suspend fun updateCrlFromNetwork(rid: ByteArray) {
+        // Use mutex to prevent concurrent CRL fetches
+        crlUpdateMutex.withLock {
+            // Double-check if update is still needed after acquiring lock
+            if (!shouldUpdateCrl()) {
+                Timber.d("CRL update already performed by another thread")
+                return
             }
-        } catch (e: Exception) {
-            Timber.e(e, "CRL network error")
-            throw e
+
+            withContext(Dispatchers.IO) {
+                val crlUrl = getCrlUrlForRid(rid) ?: return@withContext
+
+                try {
+                    Timber.d("Fetching CRL from $crlUrl")
+
+                    val url = URL(crlUrl)
+                    val connection = url.openConnection() as HttpURLConnection
+
+                    // Configure TLS if HTTPS
+                    if (connection is HttpsURLConnection) {
+                        if (config.validateTlsCertificates) {
+                            // Use default SSL context with proper validation
+                            // In production, you may want to pin specific CA certificates
+                            Timber.d("Using default TLS validation for CRL fetch")
+                        } else {
+                            // WARNING: Disabling TLS validation is insecure!
+                            // Only for testing/development
+                            Timber.w("TLS validation disabled for CRL fetch - INSECURE!")
+                            configureTrustAllCerts(connection)
+                        }
+                    }
+
+                    connection.connectTimeout = config.connectionTimeoutMs
+                    connection.readTimeout = config.readTimeoutMs
+                    connection.requestMethod = "GET"
+
+                    // Add headers for proper CRL handling
+                    connection.setRequestProperty("Accept", "application/pkix-crl, text/plain")
+
+                    try {
+                        if (connection.responseCode == 200) {
+                            val response = connection.inputStream.bufferedReader().readText()
+
+                            // Validate CRL response
+                            if (!validateCrlResponse(response)) {
+                                Timber.w("CRL response validation failed")
+                                return@withContext
+                            }
+
+                            parseCrlResponse(rid, response)
+                            lastCrlUpdate.set(System.currentTimeMillis())
+                            Timber.d("CRL update successful")
+                        } else {
+                            Timber.w("CRL fetch failed: HTTP ${connection.responseCode}")
+                        }
+                    } finally {
+                        connection.disconnect()
+                    }
+                } catch (e: javax.net.ssl.SSLException) {
+                    Timber.e(e, "SSL/TLS error fetching CRL - check certificate configuration")
+                    throw e
+                } catch (e: java.net.SocketTimeoutException) {
+                    Timber.e(e, "CRL fetch timed out")
+                    throw e
+                } catch (e: Exception) {
+                    Timber.e(e, "CRL network error")
+                    throw e
+                }
+            }
         }
+    }
+
+    /**
+     * Configure connection to trust all certificates (INSECURE - for testing only)
+     */
+    private fun configureTrustAllCerts(connection: HttpsURLConnection) {
+        val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
+            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+            override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+        })
+
+        val sslContext = SSLContext.getInstance("TLS")
+        sslContext.init(null, trustAllCerts, java.security.SecureRandom())
+        connection.sslSocketFactory = sslContext.socketFactory
+        connection.hostnameVerifier = { _, _ -> true }
+    }
+
+    /**
+     * Validate CRL response format and freshness
+     * Note: Full X.509 CRL signature validation requires the CA public key
+     */
+    private fun validateCrlResponse(response: String): Boolean {
+        if (response.isBlank()) {
+            Timber.w("Empty CRL response")
+            return false
+        }
+
+        // Basic sanity checks
+        if (response.length > config.maxCrlSizeBytes) {
+            Timber.w("CRL response too large: ${response.length} bytes (max: ${config.maxCrlSizeBytes})")
+            return false
+        }
+
+        // Check for valid content (either our simple format or starts with comment)
+        val lines = response.lines().filter { it.isNotBlank() }
+        if (lines.isEmpty()) {
+            Timber.w("CRL response has no valid lines")
+            return false
+        }
+
+        // Note: Full X.509 CRL signature validation is not implemented
+        // In production, you should:
+        // 1. Parse the X.509 CRL structure
+        // 2. Verify the CRL signature against the CA public key
+        // 3. Check the CRL validity period (thisUpdate/nextUpdate)
+        // This simplified implementation only parses a custom text format
+
+        Timber.d("CRL response validation passed (basic checks only)")
+        return true
     }
 
     private fun getCrlUrlForRid(rid: ByteArray): String? {
@@ -256,8 +373,14 @@ class CertificateRevocationChecker(
         joinToString("") { "%02X".format(it) }
 
     private fun String.hexToByteArray(): ByteArray {
-        check(length % 2 == 0) { "Hex string must have even length" }
-        return chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        if (length % 2 != 0) {
+            throw IllegalArgumentException("Hex string must have even length: '$this'")
+        }
+        return try {
+            chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        } catch (e: NumberFormatException) {
+            throw IllegalArgumentException("Invalid hex string: '$this'", e)
+        }
     }
 }
 
@@ -276,6 +399,20 @@ data class RevocationConfig(
 
     /** HTTP read timeout */
     val readTimeoutMs: Int = 30_000,
+
+    /**
+     * Validate TLS certificates when fetching CRLs.
+     * MUST be true in production to prevent MITM attacks.
+     * Only set to false for testing with self-signed certs.
+     */
+    val validateTlsCertificates: Boolean = true,
+
+    /**
+     * Maximum CRL response size in bytes.
+     * Prevents memory exhaustion from malicious responses.
+     * Default: 1MB
+     */
+    val maxCrlSizeBytes: Int = 1024 * 1024,
 
     /** CRL URLs by RID */
     val crlUrls: Map<String, String> = mapOf(

@@ -34,14 +34,39 @@ object IssuerScriptAuthenticator {
         sessionKey: ByteArray,
         arpcMethod: ArpcMethod = ArpcMethod.METHOD_1
     ): IssuerAuthResult {
+        // Validate inputs
         if (issuerAuthData.isEmpty()) {
             Timber.w("No issuer authentication data (Tag 91) provided")
             return IssuerAuthResult.NoAuthData
         }
 
+        if (arqc.size != 8) {
+            Timber.w("Invalid ARQC size: ${arqc.size} bytes (expected 8)")
+            return IssuerAuthResult.Failed("Invalid ARQC size: ${arqc.size}")
+        }
+
+        if (sessionKey.size != 16) {
+            Timber.w("Invalid session key size: ${sessionKey.size} bytes (expected 16)")
+            return IssuerAuthResult.Failed("Invalid session key size: ${sessionKey.size}")
+        }
+
+        // Validate Tag 91 structure based on method
         return when (arpcMethod) {
-            ArpcMethod.METHOD_1 -> verifyArpcMethod1(arqc, issuerAuthData, arc, sessionKey)
-            ArpcMethod.METHOD_2 -> verifyArpcMethod2(arqc, issuerAuthData, sessionKey)
+            ArpcMethod.METHOD_1 -> {
+                if (issuerAuthData.size < 8) {
+                    return IssuerAuthResult.Failed("Tag 91 too short for Method 1: ${issuerAuthData.size} bytes (need 8)")
+                }
+                if (arc.size != 2) {
+                    return IssuerAuthResult.Failed("Invalid ARC size: ${arc.size} bytes (expected 2)")
+                }
+                verifyArpcMethod1(arqc, issuerAuthData, arc, sessionKey)
+            }
+            ArpcMethod.METHOD_2 -> {
+                if (issuerAuthData.size < 8) {
+                    return IssuerAuthResult.Failed("Tag 91 too short for Method 2: ${issuerAuthData.size} bytes (need 8)")
+                }
+                verifyArpcMethod2(arqc, issuerAuthData, sessionKey)
+            }
         }
     }
 
@@ -117,7 +142,7 @@ object IssuerScriptAuthenticator {
 
     /**
      * Validate script command whitelist
-     * Only allow safe APDU commands in issuer scripts
+     * Only allow safe APDU commands in issuer scripts per EMV Book 3 Section 10.10
      *
      * @param command Raw APDU command from script
      * @return true if command is allowed
@@ -128,15 +153,38 @@ object IssuerScriptAuthenticator {
         val cla = command[0].toInt() and 0xFF
         val ins = command[1].toInt() and 0xFF
 
-        // Allowed commands per EMV Book 3 and ISO 7816-9
+        // Check CLA - must be valid ISO 7816-4 format
+        // Bits 7-5: 000 = ISO, 01x = proprietary, 1xx = invalid
+        val claValid = (cla and 0x80) == 0 || (cla and 0xE0) == 0x80
+
+        if (!claValid) {
+            Timber.w("Blocked script command with invalid CLA: %02X", cla)
+            return false
+        }
+
+        // Allowed commands per EMV Book 3 Section 10.10 and ISO 7816-9
+        // Complete list of commands that may appear in issuer scripts
         val allowed = when (ins) {
-            0x1E -> true  // APPLICATION BLOCK (ISO 7816-9)
+            // Card/Application state management (ISO 7816-9)
+            0x1E -> true  // APPLICATION BLOCK
             0x18 -> true  // APPLICATION UNBLOCK
             0x16 -> true  // CARD BLOCK
-            0x24 -> true  // PIN CHANGE/UNBLOCK
+
+            // PIN management
+            0x24 -> true  // PIN CHANGE/UNBLOCK (CHANGE REFERENCE DATA)
+            0x2C -> true  // RESET RETRY COUNTER
+
+            // Data update commands
             0xD6 -> true  // UPDATE BINARY
             0xDC -> true  // UPDATE RECORD
-            0xDA -> true  // PUT DATA
+            0xDA -> true  // PUT DATA (single tag)
+            0xDB -> true  // PUT DATA (multiple tags, odd INS)
+
+            // Less common but valid script commands
+            0xD2 -> true  // WRITE RECORD
+            0x04 -> true  // DEACTIVATE FILE (ISO 7816-9, sometimes used)
+            0x44 -> true  // ACTIVATE FILE (ISO 7816-9)
+
             else -> false
         }
 
@@ -151,56 +199,118 @@ object IssuerScriptAuthenticator {
      * Parse issuer script template (Tag 71 or 72)
      * Extracts individual commands (Tag 86) from script
      *
+     * Handles:
+     * - Direct Tag 86 commands
+     * - Nested TLV templates containing Tag 86
+     * - Multiple Tag 86 in sequence
+     *
      * @param scriptTemplate Raw Tag 71 or 72 data
      * @return List of parsed script commands
      */
     fun parseScriptTemplate(scriptTemplate: ByteArray): List<ScriptCommand> {
         val commands = mutableListOf<ScriptCommand>()
-        var offset = 0
+        parseScriptTemplateRecursive(scriptTemplate, 0, scriptTemplate.size, commands)
+        Timber.d("Parsed ${commands.size} script commands, ${commands.count { it.isAllowed }} allowed")
+        return commands
+    }
 
-        while (offset < scriptTemplate.size) {
-            // Look for Tag 86 (Issuer Script Command)
-            if (scriptTemplate[offset] != 0x86.toByte()) {
-                offset++
-                continue
-            }
+    /**
+     * Recursively parse TLV structure to find Tag 86 commands
+     */
+    private fun parseScriptTemplateRecursive(
+        data: ByteArray,
+        startOffset: Int,
+        endOffset: Int,
+        commands: MutableList<ScriptCommand>
+    ) {
+        var offset = startOffset
+
+        while (offset < endOffset) {
+            // Parse tag
+            if (offset >= data.size) break
+            var tag = data[offset].toInt() and 0xFF
             offset++
 
-            if (offset >= scriptTemplate.size) break
+            // Check for multi-byte tag (bits 5-1 all set = 0x1F)
+            if ((tag and 0x1F) == 0x1F) {
+                if (offset >= data.size) break
+                // Multi-byte tag - read subsequent bytes
+                var nextByte = data[offset].toInt() and 0xFF
+                tag = (tag shl 8) or nextByte
+                offset++
 
-            // Parse length (handles 1 or 2 byte length)
-            var length = scriptTemplate[offset].toInt() and 0xFF
+                // Continue while bit 8 is set
+                while ((nextByte and 0x80) != 0 && offset < data.size) {
+                    nextByte = data[offset].toInt() and 0xFF
+                    tag = (tag shl 8) or nextByte
+                    offset++
+                }
+            }
+
+            if (offset >= data.size) break
+
+            // Parse length
+            var length = data[offset].toInt() and 0xFF
             offset++
 
             if (length == 0x81) {
-                // Two-byte length form
-                if (offset >= scriptTemplate.size) break
-                length = scriptTemplate[offset].toInt() and 0xFF
+                // Two-byte length form (1 byte follows)
+                if (offset >= data.size) break
+                length = data[offset].toInt() and 0xFF
                 offset++
             } else if (length == 0x82) {
-                // Three-byte length form
-                if (offset + 1 >= scriptTemplate.size) break
-                length = ((scriptTemplate[offset].toInt() and 0xFF) shl 8) or
-                        (scriptTemplate[offset + 1].toInt() and 0xFF)
+                // Three-byte length form (2 bytes follow)
+                if (offset + 1 >= data.size) break
+                length = ((data[offset].toInt() and 0xFF) shl 8) or
+                        (data[offset + 1].toInt() and 0xFF)
                 offset += 2
+            } else if ((length and 0x80) != 0) {
+                // Length encoding error - skip this byte and continue
+                Timber.w("Invalid length encoding at offset ${offset - 1}")
+                continue
             }
 
-            if (offset + length > scriptTemplate.size) break
+            if (offset + length > endOffset) {
+                Timber.w("TLV length exceeds boundary: offset=$offset, length=$length, end=$endOffset")
+                break
+            }
 
-            val commandData = scriptTemplate.copyOfRange(offset, offset + length)
-            val isAllowed = isCommandAllowed(commandData)
+            val valueStart = offset
+            val valueEnd = offset + length
 
-            commands.add(ScriptCommand(
-                data = commandData,
-                isAllowed = isAllowed,
-                instruction = if (commandData.size >= 2) commandData[1] else 0
-            ))
+            when {
+                // Tag 86 - Issuer Script Command
+                tag == 0x86 -> {
+                    val commandData = data.copyOfRange(valueStart, valueEnd)
+                    val isAllowed = isCommandAllowed(commandData)
+                    commands.add(ScriptCommand(
+                        data = commandData,
+                        isAllowed = isAllowed,
+                        instruction = if (commandData.size >= 2) commandData[1] else 0
+                    ))
+                }
 
-            offset += length
+                // Constructed tag (bit 6 of first byte set) - recurse into it
+                isConstructedTag(tag) -> {
+                    parseScriptTemplateRecursive(data, valueStart, valueEnd, commands)
+                }
+            }
+
+            offset = valueEnd
         }
+    }
 
-        Timber.d("Parsed ${commands.size} script commands, ${commands.count { it.isAllowed }} allowed")
-        return commands
+    /**
+     * Check if a tag is constructed (contains nested TLVs)
+     */
+    private fun isConstructedTag(tag: Int): Boolean {
+        // Bit 6 (0x20) of the first byte indicates constructed
+        val firstByte = when {
+            tag > 0xFFFF -> (tag shr 16) and 0xFF
+            tag > 0xFF -> (tag shr 8) and 0xFF
+            else -> tag
+        }
+        return (firstByte and 0x20) != 0
     }
 
     /**
@@ -257,9 +367,14 @@ object IssuerScriptAuthenticator {
                 0x18 -> "APPLICATION UNBLOCK"
                 0x16 -> "CARD BLOCK"
                 0x24 -> "PIN CHANGE/UNBLOCK"
+                0x2C -> "RESET RETRY COUNTER"
                 0xD6 -> "UPDATE BINARY"
                 0xDC -> "UPDATE RECORD"
                 0xDA -> "PUT DATA"
+                0xDB -> "PUT DATA (ODD)"
+                0xD2 -> "WRITE RECORD"
+                0x04 -> "DEACTIVATE FILE"
+                0x44 -> "ACTIVATE FILE"
                 else -> "UNKNOWN (0x${"%02X".format(instruction)})"
             }
 

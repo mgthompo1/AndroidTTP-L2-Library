@@ -672,14 +672,40 @@ class MastercardKernel(
         return false
     }
 
+    /**
+     * Parse expiry date from BCD-encoded YYMM format.
+     * Uses sliding window to handle century transitions correctly.
+     */
     private fun parseExpiryDate(data: ByteArray): LocalDate? {
         return try {
             val hex = data.toHexString()
-            val year = 2000 + hex.substring(0, 2).toInt()
+            if (hex.length < 4) return null
+            val yy = hex.substring(0, 2).toInt()
             val month = hex.substring(2, 4).toInt()
+
+            // Use sliding window for year conversion
+            val currentYear = LocalDate.now().year
+            val year = bcdYearToFullYear(yy, currentYear)
+
             LocalDate.of(year, month, 1)
         } catch (e: Exception) {
             null
+        }
+    }
+
+    /**
+     * Convert 2-digit BCD year to full 4-digit year using sliding window.
+     */
+    private fun bcdYearToFullYear(yy: Int, currentYear: Int): Int {
+        val currentCentury = (currentYear / 100) * 100
+        val currentYY = currentYear % 100
+        val diff = yy - currentYY
+
+        return when {
+            diff >= 0 && diff <= 50 -> currentCentury + yy
+            diff < 0 && diff >= -50 -> currentCentury + yy
+            diff > 50 -> currentCentury - 100 + yy
+            else -> currentCentury + 100 + yy
         }
     }
 }

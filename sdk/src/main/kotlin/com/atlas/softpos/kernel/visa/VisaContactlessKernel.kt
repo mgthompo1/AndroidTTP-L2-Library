@@ -1508,16 +1508,38 @@ class VisaContactlessKernel(
      * @param currentYear Current 4-digit year for context
      * @return Full 4-digit year
      */
+    /**
+     * Convert 2-digit BCD year to full 4-digit year using sliding window.
+     *
+     * Uses a 50-year sliding window centered on current year:
+     * - Years within 50 years in the future: current or next century
+     * - Years more than 50 years in the past: previous century
+     *
+     * This handles payment card validity correctly:
+     * - Cards typically valid 3-5 years
+     * - A card with yy=95 in 2025 is 1995 (expired)
+     * - A card with yy=30 in 2025 is 2030 (valid)
+     * - A card with yy=05 in 2099 is 2105 (valid)
+     *
+     * @param yy 2-digit year (0-99)
+     * @param currentYear Current 4-digit year for context
+     * @return Full 4-digit year
+     */
     private fun bcdYearToFullYear(yy: Int, currentYear: Int): Int {
         val currentCentury = (currentYear / 100) * 100
         val currentYY = currentYear % 100
 
-        // Use sliding window: if yy is more than 20 years in the past from current YY,
-        // assume it's in the next century. If more than 80 years in the future, assume previous century.
+        // Calculate the difference
+        val diff = yy - currentYY
+
         return when {
-            yy >= 80 && currentYY < 80 -> currentCentury - 100 + yy  // e.g., 99 in 2025 = 1999
-            yy < 20 && currentYY >= 80 -> currentCentury + 100 + yy  // e.g., 05 in 2099 = 2105
-            else -> currentCentury + yy
+            // yy is within 50 years ahead of currentYY (same or next century)
+            diff >= 0 && diff <= 50 -> currentCentury + yy
+            diff < 0 && diff >= -50 -> currentCentury + yy
+            // yy is more than 50 years ahead - it's actually in the previous century
+            diff > 50 -> currentCentury - 100 + yy
+            // yy is more than 50 years behind - it's actually in the next century
+            else -> currentCentury + 100 + yy
         }
     }
 

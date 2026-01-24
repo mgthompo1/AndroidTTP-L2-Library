@@ -34,6 +34,7 @@ object EmvSessionKeyDerivation {
     ): ByteArray {
         require(issuerMasterKey.size == 16) { "Issuer Master Key must be 16 bytes" }
         require(pan.isNotEmpty() && pan.size <= 10) { "PAN must be 1-10 bytes (BCD)" }
+        require(isValidBcdPan(pan)) { "PAN must be valid BCD (digits 0-9 only, optional F padding)" }
 
         // Build derivation data: rightmost 16 digits of PAN || PSN, left-padded with zeros
         // Per EMV Book 2 A1.3.1: Use decimal digits of PAN
@@ -43,7 +44,8 @@ object EmvSessionKeyDerivation {
         val leftHalf = des3EncryptBlock(derivationInput, issuerMasterKey)
 
         // Derive right half: 3DES encrypt (derivation data XOR FFFFFFFFFFFFFFFF)
-        val invertedInput = derivationInput.map { (it.toInt() xor 0xFF).toByte() }.toByteArray()
+        // Use unsigned conversion to avoid sign extension issues
+        val invertedInput = derivationInput.map { ((it.toInt() and 0xFF) xor 0xFF).toByte() }.toByteArray()
         val rightHalf = des3EncryptBlock(invertedInput, issuerMasterKey)
 
         val masterKey = leftHalf + rightHalf
@@ -137,6 +139,9 @@ object EmvSessionKeyDerivation {
         return when (cvn) {
             10 -> {
                 // CVN 10: SK = MK_AC (no derivation, use master key directly)
+                // IMPORTANT: CVN 10 relies on ATC being included in cryptogram input
+                // to provide transaction uniqueness. Ensure ATC is properly managed.
+                Timber.d("CVN 10: Using ICC Master Key directly (no session key derivation)")
                 iccMasterKey.copyOf()
             }
             17, 18 -> {
@@ -284,7 +289,9 @@ object EmvSessionKeyDerivation {
         val panDigits = panHex.trimEnd('F', 'f')
 
         // PSN is 0-99, format as 2 decimal digits
-        val psnDecimal = "%02d".format(psn.toInt() and 0xFF)
+        // Clamp to valid range to prevent format string issues
+        val psnValue = (psn.toInt() and 0xFF).coerceIn(0, 99)
+        val psnDecimal = "%02d".format(psnValue)
 
         // Concatenate PAN digits + PSN digits
         val combined = panDigits + psnDecimal
@@ -297,7 +304,29 @@ object EmvSessionKeyDerivation {
         }
 
         // Convert to 8 bytes (each byte = 2 decimal digits as BCD)
-        return derivationString.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        // Use try-catch in case of invalid hex (shouldn't happen with validated input)
+        return try {
+            derivationString.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        } catch (e: NumberFormatException) {
+            Timber.e(e, "Invalid derivation string: $derivationString")
+            throw IllegalArgumentException("Invalid PAN format for key derivation", e)
+        }
+    }
+
+    /**
+     * Validate that PAN is properly BCD encoded (digits 0-9, optional F padding)
+     */
+    private fun isValidBcdPan(pan: ByteArray): Boolean {
+        for (byte in pan) {
+            val highNibble = (byte.toInt() shr 4) and 0x0F
+            val lowNibble = byte.toInt() and 0x0F
+
+            // High nibble must be 0-9 or F (padding)
+            if (highNibble > 9 && highNibble != 0x0F) return false
+            // Low nibble must be 0-9 or F (padding)
+            if (lowNibble > 9 && lowNibble != 0x0F) return false
+        }
+        return true
     }
 
     private fun des3EncryptBlock(data: ByteArray, key: ByteArray): ByteArray {

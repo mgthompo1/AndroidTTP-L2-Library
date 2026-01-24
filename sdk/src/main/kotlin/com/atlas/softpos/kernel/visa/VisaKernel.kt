@@ -690,18 +690,24 @@ class VisaKernel(
     /**
      * Parse BCD-encoded date (YYMMDD format)
      * EMV dates are stored as 3-byte BCD: YY MM DD
+     * Uses sliding window for century handling.
      */
     private fun parseExpiryDate(data: ByteArray): LocalDate? {
         if (data.size < 2) return null
         return try {
             // BCD decode - each nibble is 0-9
-            val year = 2000 + decodeBcdByte(data[0])
+            val yy = decodeBcdByte(data[0])
             val month = decodeBcdByte(data[1])
             val day = if (data.size > 2) {
                 decodeBcdByte(data[2])
             } else {
                 28  // Default to end of month if day not present
             }
+
+            // Use sliding window for year conversion
+            val currentYear = LocalDate.now().year
+            val year = bcdYearToFullYear(yy, currentYear)
+
             // Handle day 0 or invalid day (some cards use 00 or 99 for end of month)
             val validDay = when {
                 day == 0 || day > 31 -> 28
@@ -723,6 +729,22 @@ class VisaKernel(
         val highNibble = (b.toInt() and 0xF0) shr 4
         val lowNibble = b.toInt() and 0x0F
         return highNibble * 10 + lowNibble
+    }
+
+    /**
+     * Convert 2-digit BCD year to full 4-digit year using sliding window.
+     */
+    private fun bcdYearToFullYear(yy: Int, currentYear: Int): Int {
+        val currentCentury = (currentYear / 100) * 100
+        val currentYY = currentYear % 100
+        val diff = yy - currentYY
+
+        return when {
+            diff >= 0 && diff <= 50 -> currentCentury + yy
+            diff < 0 && diff >= -50 -> currentCentury + yy
+            diff > 50 -> currentCentury - 100 + yy
+            else -> currentCentury + 100 + yy
+        }
     }
 }
 

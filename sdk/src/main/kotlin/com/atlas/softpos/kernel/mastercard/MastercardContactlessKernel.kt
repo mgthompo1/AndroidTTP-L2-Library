@@ -1897,17 +1897,47 @@ class MastercardContactlessKernel(
     }
 
     /**
-     * Parse expiry date from BCD format
+     * Parse expiry date from BCD-encoded YYMM format.
+     * Uses sliding window to handle century transitions correctly.
      */
     private fun parseExpiryDate(data: ByteArray): LocalDate? {
         return try {
             val hex = data.toHexString()
             if (hex.length < 4) return null
-            val year = 2000 + hex.substring(0, 2).toInt()
+            val yy = hex.substring(0, 2).toInt()
             val month = hex.substring(2, 4).toInt()
-            LocalDate.of(year, month, 1).plusMonths(1).minusDays(1)
+
+            // Use sliding window for year conversion
+            val currentYear = java.time.LocalDate.now().year
+            val year = bcdYearToFullYear(yy, currentYear)
+
+            // Return last day of the expiry month
+            java.time.LocalDate.of(year, month, 1).plusMonths(1).minusDays(1)
         } catch (e: Exception) {
+            Timber.w(e, "Failed to parse expiry date")
             null
+        }
+    }
+
+    /**
+     * Convert 2-digit BCD year to full 4-digit year using sliding window.
+     *
+     * Uses a 50-year sliding window centered on current year:
+     * - Years within 50 years in the future: current or next century
+     * - Years more than 50 years in the past: previous century
+     *
+     * Consistent with Visa kernel implementation.
+     */
+    private fun bcdYearToFullYear(yy: Int, currentYear: Int): Int {
+        val currentCentury = (currentYear / 100) * 100
+        val currentYY = currentYear % 100
+        val diff = yy - currentYY
+
+        return when {
+            diff >= 0 && diff <= 50 -> currentCentury + yy
+            diff < 0 && diff >= -50 -> currentCentury + yy
+            diff > 50 -> currentCentury - 100 + yy
+            else -> currentCentury + 100 + yy
         }
     }
 

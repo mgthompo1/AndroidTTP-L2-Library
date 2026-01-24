@@ -17,7 +17,8 @@ import timber.log.Timber
  * Reference: EMV Book 3 Section 10.10 - Script Processing
  */
 class IssuerScriptProcessor(
-    private val transceiver: CardTransceiver
+    private val transceiver: CardTransceiver,
+    private val config: ScriptProcessorConfig = ScriptProcessorConfig()
 ) {
     /**
      * Process issuer scripts with full authentication
@@ -55,6 +56,13 @@ class IssuerScriptProcessor(
         val commands = IssuerScriptAuthenticator.parseScriptTemplate(scriptData)
         if (commands.isEmpty()) {
             return ScriptProcessingResult.NoScripts
+        }
+
+        // Limit number of commands to prevent resource exhaustion
+        if (commands.size > config.maxCommandsPerScript) {
+            Timber.w("Script has ${commands.size} commands, exceeding limit of ${config.maxCommandsPerScript}")
+            setTvrScriptFailed(tvr, scriptType)
+            return ScriptProcessingResult.Failed(emptyList())
         }
 
         val results = mutableListOf<CommandResult>()
@@ -116,7 +124,7 @@ class IssuerScriptProcessor(
     }
 
     /**
-     * Execute a single script command
+     * Execute a single script command with timeout protection
      */
     private suspend fun executeScriptCommand(
         command: IssuerScriptAuthenticator.ScriptCommand
@@ -124,9 +132,15 @@ class IssuerScriptProcessor(
         return try {
             // Build APDU from raw command data
             val apdu = buildApduFromRaw(command.data)
-                ?: return CommandResult(command, CommandStatus.INVALID, 0)
+            if (apdu == null) {
+                Timber.w("Invalid APDU format in script command: ${command.instructionName}")
+                return CommandResult(command, CommandStatus.INVALID, 0)
+            }
 
-            val response = transceiver.transceive(apdu)
+            // Execute with timeout protection
+            val response = kotlinx.coroutines.withTimeout(config.commandTimeoutMs) {
+                transceiver.transceive(apdu)
+            }
 
             val status = when {
                 response.isSuccess -> CommandStatus.SUCCESS
@@ -134,49 +148,99 @@ class IssuerScriptProcessor(
                 response.sw == 0x6984 -> CommandStatus.FAILED   // Referenced data invalidated
                 response.sw == 0x6A82 -> CommandStatus.FAILED   // File not found
                 response.sw == 0x6A80 -> CommandStatus.FAILED   // Incorrect data
+                response.sw == 0x6A81 -> CommandStatus.FAILED   // Function not supported
+                response.sw == 0x6983 -> CommandStatus.FAILED   // Authentication method blocked
+                (response.sw and 0xFFF0) == 0x63C0 -> CommandStatus.FAILED  // PIN tries remaining
                 else -> CommandStatus.FAILED
             }
 
             Timber.d("Script command ${command.instructionName}: SW=%04X, status=$status", response.sw)
-
             CommandResult(command, status, response.sw)
+
+        } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+            Timber.e("Script command timed out after ${config.commandTimeoutMs}ms: ${command.instructionName}")
+            CommandResult(command, CommandStatus.ERROR, 0x6F00)  // Use 6F00 for timeout
+        } catch (e: java.io.IOException) {
+            Timber.e(e, "I/O error during script command: ${command.instructionName}")
+            CommandResult(command, CommandStatus.ERROR, 0x6F00)
+        } catch (e: IllegalArgumentException) {
+            Timber.e(e, "Invalid argument in script command: ${command.instructionName}")
+            CommandResult(command, CommandStatus.INVALID, 0)
         } catch (e: Exception) {
-            Timber.e(e, "Script command execution failed")
-            CommandResult(command, CommandStatus.ERROR, 0)
+            // Log unexpected errors with full stack trace for debugging
+            Timber.e(e, "Unexpected error executing script command: ${command.instructionName}")
+            CommandResult(command, CommandStatus.ERROR, 0x6F00)
         }
     }
 
     /**
      * Build CommandApdu from raw command bytes
+     *
+     * APDU Cases (ISO 7816-4):
+     * - Case 1: CLA INS P1 P2 (4 bytes) - No data, no response data expected
+     * - Case 2: CLA INS P1 P2 Le (5 bytes) - No data, response data expected
+     * - Case 3: CLA INS P1 P2 Lc Data (5+Lc bytes) - Data present, no response expected
+     * - Case 4: CLA INS P1 P2 Lc Data Le (6+Lc bytes) - Data present, response expected
+     *
+     * Disambiguation: When size == 5, we check if byte[4] could be a valid Lc.
+     * For issuer scripts, commands with no data typically use Case 1, not Case 2.
+     * Case 2 is rare in issuer scripts (would be for reading data).
      */
     private fun buildApduFromRaw(data: ByteArray): CommandApdu? {
-        if (data.size < 4) return null
+        if (data.size < 4) {
+            Timber.w("APDU too short: ${data.size} bytes (minimum 4)")
+            return null
+        }
 
         val cla = data[0]
         val ins = data[1]
         val p1 = data[2]
         val p2 = data[3]
 
-        return when {
-            data.size == 4 -> {
-                // Case 1: No data, no Le
+        return when (data.size) {
+            4 -> {
+                // Case 1: CLA INS P1 P2 - No data, no Le
                 CommandApdu(cla, ins, p1, p2, null, null)
             }
-            data.size == 5 -> {
-                // Case 2: No data, Le present
-                CommandApdu(cla, ins, p1, p2, null, data[4].toInt() and 0xFF)
+            5 -> {
+                // Ambiguous: Could be Case 2 (Le) or Case 3 (Lc=0 which is unusual)
+                // For issuer scripts, Case 2 (reading data back) is rare.
+                // If byte[4] == 0, treat as Case 1 effectively (Lc=0, no data)
+                // If byte[4] != 0, treat as Case 2 (Le for expected response)
+                val fifthByte = data[4].toInt() and 0xFF
+                if (fifthByte == 0) {
+                    // Lc=0 means no data - same as Case 1
+                    CommandApdu(cla, ins, p1, p2, null, null)
+                } else {
+                    // Treat as Le (expected response length)
+                    CommandApdu(cla, ins, p1, p2, null, fifthByte)
+                }
             }
             else -> {
-                // Case 3 or 4: Data present
+                // 6+ bytes: Case 3 or Case 4 - Data present
                 val lc = data[4].toInt() and 0xFF
-                if (data.size < 5 + lc) return null
 
-                val commandData = data.copyOfRange(5, 5 + lc)
-                val le = if (data.size > 5 + lc) {
-                    data[5 + lc].toInt() and 0xFF
-                } else null
+                // Validate Lc
+                if (lc == 0) {
+                    // Lc=0 with extra bytes - treat rest as Le (Case 2 extended?)
+                    if (data.size == 6) {
+                        CommandApdu(cla, ins, p1, p2, null, data[5].toInt() and 0xFF)
+                    } else {
+                        Timber.w("Invalid APDU: Lc=0 but ${data.size - 5} extra bytes")
+                        return null
+                    }
+                } else if (data.size < 5 + lc) {
+                    Timber.w("Invalid APDU: Lc=$lc but only ${data.size - 5} bytes available")
+                    return null
+                } else {
+                    // Case 3 or 4
+                    val commandData = data.copyOfRange(5, 5 + lc)
+                    val le = if (data.size > 5 + lc) {
+                        data[5 + lc].toInt() and 0xFF
+                    } else null
 
-                CommandApdu(cla, ins, p1, p2, commandData, le)
+                    CommandApdu(cla, ins, p1, p2, commandData, le)
+                }
             }
         }
     }
@@ -185,18 +249,27 @@ class IssuerScriptProcessor(
      * Set TVR script processing failed bit
      * TVR Byte 5, Bit 2 = Script processing failed after final GENERATE AC
      * TVR Byte 5, Bit 3 = Script processing failed before final GENERATE AC
+     *
+     * Note: TVR is modified in-place. Caller must ensure the TVR byte array
+     * passed to processScripts() is the actual TVR used in the transaction.
      */
     private fun setTvrScriptFailed(tvr: ByteArray, scriptType: ScriptType) {
-        if (tvr.size < 5) return
+        if (tvr.size < 5) {
+            Timber.w("TVR too short to set script failure bit: ${tvr.size} bytes (need 5)")
+            return
+        }
 
+        val previousValue = tvr[4]
         when (scriptType) {
             ScriptType.SCRIPT_71 -> {
                 // Bit 3 of byte 5 (before final GENERATE AC)
                 tvr[4] = (tvr[4].toInt() or 0x08).toByte()
+                Timber.d("TVR byte 5 updated for Script 71 failure: %02X -> %02X", previousValue, tvr[4])
             }
             ScriptType.SCRIPT_72 -> {
                 // Bit 2 of byte 5 (after final GENERATE AC)
                 tvr[4] = (tvr[4].toInt() or 0x04).toByte()
+                Timber.d("TVR byte 5 updated for Script 72 failure: %02X -> %02X", previousValue, tvr[4])
             }
         }
     }
@@ -296,3 +369,29 @@ data class IssuerScripts(
         return this.contentEquals(other)
     }
 }
+
+/**
+ * Configuration for script processing
+ */
+data class ScriptProcessorConfig(
+    /**
+     * Timeout for individual script command execution in milliseconds.
+     * Protects against malicious scripts that could hang the terminal.
+     * Default: 5000ms (5 seconds) per command.
+     */
+    val commandTimeoutMs: Long = 5000L,
+
+    /**
+     * Maximum number of commands allowed in a single script.
+     * Protects against resource exhaustion.
+     * Default: 50 commands.
+     */
+    val maxCommandsPerScript: Int = 50,
+
+    /**
+     * Whether to continue processing after a command failure.
+     * Per EMV spec, script processing should continue after non-abort failures.
+     * Default: true.
+     */
+    val continueOnFailure: Boolean = true
+)
