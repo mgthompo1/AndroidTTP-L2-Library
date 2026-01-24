@@ -279,7 +279,7 @@ class CertificateRevocationChecker(
         val sslContext = SSLContext.getInstance("TLS")
         sslContext.init(null, trustAllCerts, java.security.SecureRandom())
         connection.sslSocketFactory = sslContext.socketFactory
-        connection.hostnameVerifier = { _, _ -> true }
+        connection.hostnameVerifier = javax.net.ssl.HostnameVerifier { _, _ -> true }
     }
 
     /**
