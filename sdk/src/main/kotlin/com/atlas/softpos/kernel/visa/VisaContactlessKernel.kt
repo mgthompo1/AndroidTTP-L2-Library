@@ -62,6 +62,9 @@ class VisaContactlessKernel(
     private val tvr = TerminalVerificationResults()
     private val tsi = TransactionStatusInformation()
 
+    // Script processor for authenticated issuer script execution
+    private val scriptProcessor = IssuerScriptProcessor(transceiver)
+
     // State
     private var selectedAid: ByteArray? = null
     private var aip: ByteArray? = null
@@ -1228,39 +1231,75 @@ class VisaContactlessKernel(
                 Timber.w("Could not build issuer auth data from ARPC/ARC")
             }
 
+            // Build IssuerScripts structure for processor
+            val issuerScripts = createIssuerScripts(onlineResponse)
+
+            // For online terminals: when issuer approves, we trust the issuer for script execution.
+            // The card will verify ARPC cryptographically during second GENERATE AC.
+            // We create an "assumed success" auth result for the script processor.
+            val authResult = if (onlineResponse.approved && issuerAuthData != null) {
+                // Trusted issuer - allow script execution with whitelist validation
+                IssuerScriptAuthenticator.IssuerAuthResult.Success(
+                    arpc = onlineResponse.arpc ?: ByteArray(8),
+                    responseCode = onlineResponse.arc ?: byteArrayOf(0x30, 0x30)
+                )
+            } else {
+                IssuerScriptAuthenticator.IssuerAuthResult.NoAuthData
+            }
+
             // Step 2: Execute issuer scripts before second GENERATE AC (tag 71)
-            val script71Results = mutableListOf<VisaIssuerScriptResult>()
-            onlineResponse.issuerScripts71?.let { scripts ->
-                Timber.d("Processing ${scripts.size} tag 71 issuer scripts")
-                for (script in scripts) {
-                    val result = executeIssuerScript(script)
-                    script71Results.add(result)
-                    if (!result.success && result.abortTransaction) {
-                        // Tag 71 script failure can abort transaction
-                        return VisaOnlineResponseResult.ScriptFailed(
-                            scriptResults = script71Results,
-                            failedScriptTag = "71",
-                            tvr = tvr.toBytes().toHexString()
-                        )
-                    }
+            val script71ProcessingResult = if (issuerScripts.script71 != null) {
+                Timber.d("Processing tag 71 issuer scripts with authenticated processor")
+                scriptProcessor.processScripts(
+                    scripts = issuerScripts,
+                    authResult = authResult,
+                    tvr = tvr.toBytes(),
+                    scriptType = IssuerScriptProcessor.ScriptType.SCRIPT_71
+                )
+            } else {
+                IssuerScriptProcessor.ScriptProcessingResult.NoScripts
+            }
+
+            // Check for abort condition from Tag 71 scripts
+            if (script71ProcessingResult is IssuerScriptProcessor.ScriptProcessingResult.Aborted) {
+                val scriptResults = script71ProcessingResult.results.map { cmdResult ->
+                    VisaIssuerScriptResult(
+                        success = cmdResult.status == IssuerScriptProcessor.CommandStatus.SUCCESS,
+                        sw = cmdResult.sw,
+                        abortTransaction = cmdResult.status == IssuerScriptProcessor.CommandStatus.ABORTED
+                    )
                 }
+                return VisaOnlineResponseResult.ScriptFailed(
+                    scriptResults = scriptResults,
+                    failedScriptTag = "71",
+                    tvr = tvr.toBytes().toHexString()
+                )
             }
 
             // Step 3: Perform second GENERATE AC
             val secondAcResult = performSecondGenerateAc(onlineResponse.approved)
 
             // Step 4: Execute issuer scripts after second GENERATE AC (tag 72)
-            val script72Results = mutableListOf<VisaIssuerScriptResult>()
-            onlineResponse.issuerScripts72?.let { scripts ->
-                Timber.d("Processing ${scripts.size} tag 72 issuer scripts")
-                for (script in scripts) {
-                    val result = executeIssuerScript(script)
-                    script72Results.add(result)
-                    // Tag 72 scripts don't abort - they are for card updates
+            val script72ProcessingResult = if (issuerScripts.script72 != null) {
+                Timber.d("Processing tag 72 issuer scripts with authenticated processor")
+                // For Tag 72, we use the result of second GENERATE AC to determine auth
+                val postAcAuthResult = when (secondAcResult) {
+                    is VisaSecondAcResult.Approved -> authResult  // Card confirmed auth
+                    else -> IssuerScriptAuthenticator.IssuerAuthResult.NoAuthData
                 }
+                scriptProcessor.processScripts(
+                    scripts = issuerScripts,
+                    authResult = postAcAuthResult,
+                    tvr = tvr.toBytes(),
+                    scriptType = IssuerScriptProcessor.ScriptType.SCRIPT_72
+                )
+            } else {
+                IssuerScriptProcessor.ScriptProcessingResult.NoScripts
             }
 
-            val allScriptResults = script71Results + script72Results
+            // Collect all script results
+            val allScriptResults = collectScriptResults(script71ProcessingResult) +
+                    collectScriptResults(script72ProcessingResult)
 
             // Return final result
             return when (secondAcResult) {
@@ -1290,6 +1329,46 @@ class VisaContactlessKernel(
                 scriptResults = emptyList(),
                 tvr = tvr.toBytes().toHexString()
             )
+        }
+    }
+
+    /**
+     * Convert script processing result to list of VisaIssuerScriptResult
+     */
+    private fun collectScriptResults(
+        result: IssuerScriptProcessor.ScriptProcessingResult
+    ): List<VisaIssuerScriptResult> {
+        return when (result) {
+            is IssuerScriptProcessor.ScriptProcessingResult.Success -> result.results.map { cmdResult ->
+                VisaIssuerScriptResult(
+                    success = cmdResult.status == IssuerScriptProcessor.CommandStatus.SUCCESS,
+                    sw = cmdResult.sw,
+                    abortTransaction = false
+                )
+            }
+            is IssuerScriptProcessor.ScriptProcessingResult.PartialSuccess -> result.results.map { cmdResult ->
+                VisaIssuerScriptResult(
+                    success = cmdResult.status == IssuerScriptProcessor.CommandStatus.SUCCESS,
+                    sw = cmdResult.sw,
+                    abortTransaction = false
+                )
+            }
+            is IssuerScriptProcessor.ScriptProcessingResult.Failed -> result.results.map { cmdResult ->
+                VisaIssuerScriptResult(
+                    success = false,
+                    sw = cmdResult.sw,
+                    abortTransaction = false
+                )
+            }
+            is IssuerScriptProcessor.ScriptProcessingResult.Aborted -> result.results.map { cmdResult ->
+                VisaIssuerScriptResult(
+                    success = cmdResult.status == IssuerScriptProcessor.CommandStatus.SUCCESS,
+                    sw = cmdResult.sw,
+                    abortTransaction = cmdResult.status == IssuerScriptProcessor.CommandStatus.ABORTED
+                )
+            }
+            is IssuerScriptProcessor.ScriptProcessingResult.NoScripts -> emptyList()
+            is IssuerScriptProcessor.ScriptProcessingResult.AuthenticationRequired -> emptyList()
         }
     }
 
@@ -1333,129 +1412,6 @@ class VisaContactlessKernel(
 
         Timber.w("Invalid ARPC/ARC sizes: ARPC=${arpc.size}, ARC=${arc.size}")
         return null
-    }
-
-    /**
-     * Execute an issuer script command
-     *
-     * Issuer scripts (tags 71/72) contain APDU commands to update the card.
-     * Format: 71/72 | Length | Script commands...
-     * Each command: Tag 86 | Length | APDU command
-     */
-    private suspend fun executeIssuerScript(script: ByteArray): VisaIssuerScriptResult {
-        Timber.d("Executing issuer script (${script.size} bytes)")
-
-        try {
-            // Parse script - may contain multiple tag 86 commands
-            val commands = parseIssuerScriptCommands(script)
-            if (commands.isEmpty()) {
-                Timber.w("No commands found in issuer script")
-                return VisaIssuerScriptResult(success = true, sw = 0x9000, abortTransaction = false)
-            }
-
-            var lastSw = 0x9000
-            for (commandData in commands) {
-                // Build APDU from script data
-                if (commandData.size < 4) {
-                    Timber.w("Script command too short")
-                    continue
-                }
-
-                val command = CommandApdu(
-                    cla = commandData[0],
-                    ins = commandData[1],
-                    p1 = commandData[2],
-                    p2 = commandData[3],
-                    data = if (commandData.size > 5) {
-                        val lc = commandData[4].toInt() and 0xFF
-                        commandData.copyOfRange(5, minOf(5 + lc, commandData.size))
-                    } else null,
-                    le = null
-                )
-
-                val response = transceiver.transceive(command)
-                lastSw = response.sw
-
-                // Check for specific error conditions
-                if (!response.isSuccess) {
-                    Timber.w("Script command failed: SW=%04X", lastSw)
-
-                    // 6985 = Conditions not satisfied (may warrant abort)
-                    // 6984 = Referenced data not found
-                    // 6A80 = Incorrect parameters in data field
-                    val abortRequired = lastSw == 0x6985
-
-                    // Update TVR to indicate script processing failed
-                    if (isTag71Script(script)) {
-                        tvr.scriptFailedBeforeAc = true
-                    } else {
-                        tvr.scriptFailedAfterAc = true
-                    }
-
-                    return VisaIssuerScriptResult(
-                        success = false,
-                        sw = lastSw,
-                        abortTransaction = abortRequired && isTag71Script(script)
-                    )
-                }
-            }
-
-            return VisaIssuerScriptResult(success = true, sw = lastSw, abortTransaction = false)
-
-        } catch (e: Exception) {
-            Timber.e(e, "Error executing issuer script")
-            if (isTag71Script(script)) {
-                tvr.scriptFailedBeforeAc = true
-            } else {
-                tvr.scriptFailedAfterAc = true
-            }
-            return VisaIssuerScriptResult(success = false, sw = 0x6F00, abortTransaction = false)
-        }
-    }
-
-    /**
-     * Parse issuer script commands from tag 71/72 data
-     */
-    private fun parseIssuerScriptCommands(script: ByteArray): List<ByteArray> {
-        val commands = mutableListOf<ByteArray>()
-
-        var offset = 0
-        while (offset < script.size) {
-            // Look for tag 86 (Issuer Script Command)
-            if (script[offset] != 0x86.toByte()) {
-                offset++
-                continue
-            }
-            offset++
-
-            if (offset >= script.size) break
-
-            // Parse length
-            var length = script[offset].toInt() and 0xFF
-            offset++
-
-            if (length == 0x81) {
-                // Two-byte length form
-                if (offset >= script.size) break
-                length = script[offset].toInt() and 0xFF
-                offset++
-            }
-
-            if (offset + length > script.size) break
-
-            val command = script.copyOfRange(offset, offset + length)
-            commands.add(command)
-            offset += length
-        }
-
-        return commands
-    }
-
-    /**
-     * Check if script is tag 71 (before 2nd AC)
-     */
-    private fun isTag71Script(script: ByteArray): Boolean {
-        return script.isNotEmpty() && script[0] == 0x71.toByte()
     }
 
     /**

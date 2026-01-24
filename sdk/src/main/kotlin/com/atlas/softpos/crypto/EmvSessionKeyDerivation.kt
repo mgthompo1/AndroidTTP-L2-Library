@@ -275,22 +275,29 @@ object EmvSessionKeyDerivation {
     // ==================== Private Helper Functions ====================
 
     private fun buildDerivationInput(pan: ByteArray, psn: Byte): ByteArray {
-        // Convert PAN to decimal string, take rightmost 16 digits, append PSN
-        val panHex = pan.toHexString()
-        val panDigits = panHex.filter { it.isDigit() }
+        // EMV Book 2 Annex A1.3.1: Derivation input is rightmost 16 digits of (PAN || PSN)
+        // PAN is BCD encoded, PSN is a single byte (0-99 decimal)
 
-        // Take rightmost 16-1=15 digits of PAN, append 1 digit PSN
-        val derivationString = if (panDigits.length >= 16) {
-            panDigits.takeLast(16)
+        // Convert PAN from BCD to decimal string
+        val panHex = pan.toHexString()
+        // Remove any trailing 'F' padding from PAN
+        val panDigits = panHex.trimEnd('F', 'f')
+
+        // PSN is 0-99, format as 2 decimal digits
+        val psnDecimal = "%02d".format(psn.toInt() and 0xFF)
+
+        // Concatenate PAN digits + PSN digits
+        val combined = panDigits + psnDecimal
+
+        // Take rightmost 16 digits, left-pad with zeros if needed
+        val derivationString = if (combined.length >= 16) {
+            combined.takeLast(16)
         } else {
-            panDigits.padStart(16, '0')
+            combined.padStart(16, '0')
         }
 
-        // Replace last 2 characters with PSN (as 2 hex digits)
-        val withPsn = derivationString.dropLast(2) + "%02X".format(psn.toInt() and 0xFF)
-
-        // Convert back to bytes (8 bytes of BCD)
-        return withPsn.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        // Convert to 8 bytes (each byte = 2 decimal digits as BCD)
+        return derivationString.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
     }
 
     private fun des3EncryptBlock(data: ByteArray, key: ByteArray): ByteArray {

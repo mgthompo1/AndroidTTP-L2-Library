@@ -128,9 +128,9 @@ object IssuerScriptAuthenticator {
         val cla = command[0].toInt() and 0xFF
         val ins = command[1].toInt() and 0xFF
 
-        // Allowed commands per EMV Book 3
+        // Allowed commands per EMV Book 3 and ISO 7816-9
         val allowed = when (ins) {
-            0x04 -> true  // APPLICATION BLOCK
+            0x1E -> true  // APPLICATION BLOCK (ISO 7816-9)
             0x18 -> true  // APPLICATION UNBLOCK
             0x16 -> true  // CARD BLOCK
             0x24 -> true  // PIN CHANGE/UNBLOCK
@@ -253,7 +253,7 @@ object IssuerScriptAuthenticator {
     ) {
         val instructionName: String
             get() = when (instruction.toInt() and 0xFF) {
-                0x04 -> "APPLICATION BLOCK"
+                0x1E -> "APPLICATION BLOCK"
                 0x18 -> "APPLICATION UNBLOCK"
                 0x16 -> "CARD BLOCK"
                 0x24 -> "PIN CHANGE/UNBLOCK"

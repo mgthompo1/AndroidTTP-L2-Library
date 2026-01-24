@@ -225,26 +225,31 @@ class CertificateRevocationChecker(
     }
 
     private fun loadKnownRevocations() {
-        // Pre-load known revoked keys from payment network bulletins
-        // These are examples - real values come from network security bulletins
+        // Load revocations from configuration
+        // IMPORTANT: Do NOT hardcode revocations here as CA key indices like 0x01 are used
+        // by both test AND production keys. Hardcoding could block legitimate production keys.
+        //
+        // Revocation lists should be:
+        // 1. Loaded from configuration passed to RevocationConfig
+        // 2. Updated via CRL from payment network bulletins
+        // 3. Managed by terminal management system
 
-        // Visa - Revoked test keys
-        addRevokedCaKey(
-            rid = "A000000003".hexToByteArray(),
-            caKeyIndex = 0x01,
-            reason = "Test key - not for production",
-            revocationDate = "2020-01-01"
-        )
+        for ((keyId, entry) in config.initialRevocations) {
+            val parts = keyId.split(":")
+            if (parts.size == 2) {
+                try {
+                    val rid = parts[0].hexToByteArray()
+                    val index = parts[1].toInt(16).toByte()
+                    addRevokedCaKey(rid, index, entry.reason, entry.revocationDate)
+                } catch (e: Exception) {
+                    Timber.w("Invalid revocation entry: $keyId - ${e.message}")
+                }
+            }
+        }
 
-        // Mastercard - Revoked old key
-        addRevokedCaKey(
-            rid = "A000000004".hexToByteArray(),
-            caKeyIndex = 0x01,
-            reason = "Key rotation - replaced by index 05",
-            revocationDate = "2019-06-01"
-        )
-
-        Timber.d("Loaded ${revokedCaKeys.size} known revoked CA keys")
+        if (revokedCaKeys.isNotEmpty()) {
+            Timber.d("Loaded ${revokedCaKeys.size} known revoked CA keys from config")
+        }
     }
 
     private fun ByteArray.toHexString(): String =
@@ -278,7 +283,25 @@ data class RevocationConfig(
         "A000000003" to "https://crl.visa.com/emv/ca-keys.crl",
         "A000000004" to "https://crl.mastercard.com/emv/ca-keys.crl",
         "A000000025" to "https://crl.americanexpress.com/emv/ca-keys.crl"
-    )
+    ),
+
+    /**
+     * Initial revocations to load at startup.
+     * Map key format: "RID:INDEX" (e.g., "A000000003:01")
+     * These should come from your terminal management system or payment network bulletins.
+     *
+     * IMPORTANT: Do NOT hardcode test key revocations as index values like 0x01
+     * are used by both test AND production keys.
+     */
+    val initialRevocations: Map<String, InitialRevocationEntry> = emptyMap()
+)
+
+/**
+ * Entry for initial revocation configuration
+ */
+data class InitialRevocationEntry(
+    val reason: String,
+    val revocationDate: String? = null
 )
 
 /**

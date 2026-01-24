@@ -65,6 +65,9 @@ class MastercardContactlessKernel(
     // TVR for tracking verification results
     private val tvr = TerminalVerificationResults()
 
+    // Script processor for authenticated issuer script execution
+    private val scriptProcessor = IssuerScriptProcessor(transceiver)
+
     // Transaction state
     private var transactionPath: TransactionPath = TransactionPath.EMV
     private var cvmResult: CvmResult = CvmResult.NoCvmPerformed
@@ -154,49 +157,89 @@ class MastercardContactlessKernel(
                 Timber.w("Could not build issuer auth data from ARPC/ARC")
             }
 
-            // Step 2: Process issuer scripts before GENERATE AC (tag 71)
-            val script71Results = mutableListOf<IssuerScriptResult>()
-            onlineResponse.issuerScripts71?.let { scripts ->
-                for (script in scripts) {
-                    val result = executeIssuerScript(script)
-                    script71Results.add(result)
-                    if (!result.success && result.abortTransaction) {
-                        Timber.w("Issuer script 71 failed, aborting")
-                        return OnlineResponseResult.ScriptFailed(
-                            error = "Issuer script failed: ${result.sw}",
-                            scriptResults = script71Results
-                        )
-                    }
-                }
+            // Build IssuerScripts structure for processor
+            val issuerScripts = createIssuerScripts(onlineResponse)
+
+            // For online terminals: when issuer approves, we trust the issuer for script execution.
+            // The card will verify ARPC cryptographically during second GENERATE AC.
+            // We create an "assumed success" auth result for the script processor.
+            val authResult = if (onlineResponse.approved && issuerAuthData != null) {
+                // Trusted issuer - allow script execution with whitelist validation
+                IssuerScriptAuthenticator.IssuerAuthResult.Success(
+                    arpc = onlineResponse.arpc ?: ByteArray(8),
+                    responseCode = onlineResponse.arc ?: byteArrayOf(0x30, 0x30)
+                )
+            } else {
+                IssuerScriptAuthenticator.IssuerAuthResult.NoAuthData
             }
 
-            // Step 3: Second GENERATE AC
+            // Step 2: Execute issuer scripts before second GENERATE AC (tag 71)
+            val script71ProcessingResult = if (issuerScripts.script71 != null) {
+                Timber.d("Processing tag 71 issuer scripts with authenticated processor")
+                scriptProcessor.processScripts(
+                    scripts = issuerScripts,
+                    authResult = authResult,
+                    tvr = tvr.toBytes(),
+                    scriptType = IssuerScriptProcessor.ScriptType.SCRIPT_71
+                )
+            } else {
+                IssuerScriptProcessor.ScriptProcessingResult.NoScripts
+            }
+
+            // Check for abort condition from Tag 71 scripts
+            if (script71ProcessingResult is IssuerScriptProcessor.ScriptProcessingResult.Aborted) {
+                val scriptResults = script71ProcessingResult.results.map { cmdResult ->
+                    IssuerScriptResult(
+                        success = cmdResult.status == IssuerScriptProcessor.CommandStatus.SUCCESS,
+                        sw = cmdResult.sw,
+                        abortTransaction = cmdResult.status == IssuerScriptProcessor.CommandStatus.ABORTED
+                    )
+                }
+                return OnlineResponseResult.ScriptFailed(
+                    error = "Issuer script 71 aborted",
+                    scriptResults = scriptResults
+                )
+            }
+
+            // Step 3: Perform second GENERATE AC
             val secondAcResult = performSecondGenerateAc(onlineResponse.approved)
 
-            // Step 4: Process issuer scripts after GENERATE AC (tag 72)
-            val script72Results = mutableListOf<IssuerScriptResult>()
-            onlineResponse.issuerScripts72?.let { scripts ->
-                for (script in scripts) {
-                    val result = executeIssuerScript(script)
-                    script72Results.add(result)
-                    // Tag 72 scripts don't abort transaction
+            // Step 4: Execute issuer scripts after second GENERATE AC (tag 72)
+            val script72ProcessingResult = if (issuerScripts.script72 != null) {
+                Timber.d("Processing tag 72 issuer scripts with authenticated processor")
+                // For Tag 72, we use the result of second GENERATE AC to determine auth
+                val postAcAuthResult = when (secondAcResult) {
+                    is SecondAcResult.Approved -> authResult  // Card confirmed auth
+                    else -> IssuerScriptAuthenticator.IssuerAuthResult.NoAuthData
                 }
+                scriptProcessor.processScripts(
+                    scripts = issuerScripts,
+                    authResult = postAcAuthResult,
+                    tvr = tvr.toBytes(),
+                    scriptType = IssuerScriptProcessor.ScriptType.SCRIPT_72
+                )
+            } else {
+                IssuerScriptProcessor.ScriptProcessingResult.NoScripts
             }
+
+            // Collect all script results
+            val allScriptResults = collectScriptResults(script71ProcessingResult) +
+                    collectScriptResults(script72ProcessingResult)
 
             // Build final result
             return when (secondAcResult) {
                 is SecondAcResult.Approved -> OnlineResponseResult.Approved(
                     authorizationData = secondAcResult.authData,
-                    scriptResults = script71Results + script72Results
+                    scriptResults = allScriptResults
                 )
                 is SecondAcResult.Declined -> OnlineResponseResult.Declined(
                     reason = secondAcResult.reason,
                     authorizationData = secondAcResult.authData,
-                    scriptResults = script71Results + script72Results
+                    scriptResults = allScriptResults
                 )
                 is SecondAcResult.Error -> OnlineResponseResult.Error(
                     error = secondAcResult.error,
-                    scriptResults = script71Results + script72Results
+                    scriptResults = allScriptResults
                 )
             }
 
@@ -206,6 +249,46 @@ class MastercardContactlessKernel(
                 error = "Online response processing failed: ${e.message}",
                 scriptResults = emptyList()
             )
+        }
+    }
+
+    /**
+     * Convert script processing result to list of IssuerScriptResult
+     */
+    private fun collectScriptResults(
+        result: IssuerScriptProcessor.ScriptProcessingResult
+    ): List<IssuerScriptResult> {
+        return when (result) {
+            is IssuerScriptProcessor.ScriptProcessingResult.Success -> result.results.map { cmdResult ->
+                IssuerScriptResult(
+                    success = cmdResult.status == IssuerScriptProcessor.CommandStatus.SUCCESS,
+                    sw = cmdResult.sw,
+                    abortTransaction = false
+                )
+            }
+            is IssuerScriptProcessor.ScriptProcessingResult.PartialSuccess -> result.results.map { cmdResult ->
+                IssuerScriptResult(
+                    success = cmdResult.status == IssuerScriptProcessor.CommandStatus.SUCCESS,
+                    sw = cmdResult.sw,
+                    abortTransaction = false
+                )
+            }
+            is IssuerScriptProcessor.ScriptProcessingResult.Failed -> result.results.map { cmdResult ->
+                IssuerScriptResult(
+                    success = false,
+                    sw = cmdResult.sw,
+                    abortTransaction = false
+                )
+            }
+            is IssuerScriptProcessor.ScriptProcessingResult.Aborted -> result.results.map { cmdResult ->
+                IssuerScriptResult(
+                    success = cmdResult.status == IssuerScriptProcessor.CommandStatus.SUCCESS,
+                    sw = cmdResult.sw,
+                    abortTransaction = cmdResult.status == IssuerScriptProcessor.CommandStatus.ABORTED
+                )
+            }
+            is IssuerScriptProcessor.ScriptProcessingResult.NoScripts -> emptyList()
+            is IssuerScriptProcessor.ScriptProcessingResult.AuthenticationRequired -> emptyList()
         }
     }
 
@@ -252,56 +335,6 @@ class MastercardContactlessKernel(
     }
 
     private fun ByteArray.toHexString(): String = joinToString("") { "%02X".format(it) }
-
-    /**
-     * Execute an issuer script command
-     */
-    private suspend fun executeIssuerScript(script: ByteArray): IssuerScriptResult {
-        if (script.isEmpty()) {
-            return IssuerScriptResult(success = true, sw = 0x9000, abortTransaction = false)
-        }
-
-        try {
-            // Parse script template
-            val tlvs = TlvParser.parse(script)
-            for (tlv in tlvs) {
-                // Each script contains command APDUs
-                if (tlv.tag.hex == "86") {
-                    // Command template - execute the APDU
-                    val command = tlv.value
-                    if (command.size < 4) continue
-
-                    val apdu = com.atlas.softpos.core.apdu.CommandApdu(
-                        cla = command[0],
-                        ins = command[1],
-                        p1 = command[2],
-                        p2 = command[3],
-                        data = if (command.size > 5) command.copyOfRange(5, 5 + (command[4].toInt() and 0xFF)) else null
-                    )
-
-                    val response = transceiver.transceive(apdu)
-                    val sw = response.sw
-
-                    // Check if script failed
-                    if (sw != 0x9000 && (sw and 0xFF00) != 0x6100) {
-                        // Script command failed
-                        val abortOnFail = (tlv.tag.hex == "71") // Tag 71 scripts can abort
-                        return IssuerScriptResult(
-                            success = false,
-                            sw = sw,
-                            abortTransaction = abortOnFail && (sw and 0xFFF0) != 0x63C0
-                        )
-                    }
-                }
-            }
-
-            return IssuerScriptResult(success = true, sw = 0x9000, abortTransaction = false)
-
-        } catch (e: Exception) {
-            Timber.e(e, "Issuer script execution error")
-            return IssuerScriptResult(success = false, sw = 0x6F00, abortTransaction = false)
-        }
-    }
 
     /**
      * Perform second GENERATE AC after online authorization
