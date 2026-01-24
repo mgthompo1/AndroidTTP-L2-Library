@@ -463,19 +463,41 @@ class VisaContactlessKernel(
      * The 'D' separator is encoded as 0x0D in the nibble stream
      */
     private fun extractPanFromTrack2(track2: ByteArray): ByteArray? {
-        // Convert to hex string to find 'D' separator
-        val hex = track2.toHexString().uppercase()
-        val separatorIndex = hex.indexOf('D')
-        if (separatorIndex <= 0) return null
+        return try {
+            // Convert to hex string to find 'D' separator
+            val hex = track2.toHexString().uppercase()
+            val separatorIndex = hex.indexOf('D')
+            if (separatorIndex <= 0) return null
 
-        // PAN is before the 'D' separator
-        val panHex = hex.substring(0, separatorIndex)
-        // Remove trailing 'F' padding if present
-        val cleanPanHex = panHex.trimEnd('F')
-        if (cleanPanHex.length < 13 || cleanPanHex.length > 19) return null
+            // PAN is before the 'D' separator
+            val panHex = hex.substring(0, separatorIndex)
+            // Remove trailing 'F' padding if present
+            val cleanPanHex = panHex.trimEnd('F')
 
-        // Convert back to BCD-encoded bytes
-        return cleanPanHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+            // Validate PAN length (13-19 digits per ISO 7812)
+            if (cleanPanHex.length < 13 || cleanPanHex.length > 19) {
+                Timber.w("Invalid PAN length in Track 2: ${cleanPanHex.length}")
+                return null
+            }
+
+            // Validate PAN contains only digits (0-9)
+            if (!cleanPanHex.all { it in '0'..'9' }) {
+                Timber.w("Invalid characters in PAN from Track 2")
+                return null
+            }
+
+            // Pad to even length for BCD conversion
+            val paddedPan = if (cleanPanHex.length % 2 != 0) cleanPanHex + "F" else cleanPanHex
+
+            // Convert to BCD-encoded bytes
+            paddedPan.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        } catch (e: NumberFormatException) {
+            Timber.w(e, "Failed to parse PAN from Track 2")
+            null
+        } catch (e: Exception) {
+            Timber.e(e, "Unexpected error extracting PAN from Track 2")
+            null
+        }
     }
 
     /**

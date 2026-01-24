@@ -154,8 +154,9 @@ object IssuerScriptAuthenticator {
         val ins = command[1].toInt() and 0xFF
 
         // Check CLA - must be valid ISO 7816-4 format
-        // Bits 7-5: 000 = ISO, 01x = proprietary, 1xx = invalid
-        val claValid = (cla and 0x80) == 0 || (cla and 0xE0) == 0x80
+        // Bits 7-6: 00/01/10 = valid (ISO or proprietary), 11 = invalid (reserved)
+        // 0x00-0xBF = valid, 0xC0-0xFF = invalid
+        val claValid = (cla and 0xC0) != 0xC0
 
         if (!claValid) {
             Timber.w("Blocked script command with invalid CLA: %02X", cla)
@@ -239,8 +240,9 @@ object IssuerScriptAuthenticator {
                 tag = (tag shl 8) or nextByte
                 offset++
 
-                // Continue while bit 8 is set
-                while ((nextByte and 0x80) != 0 && offset < data.size) {
+                // Continue while bit 8 is set (more bytes follow)
+                // Bounds check FIRST to prevent out-of-bounds access
+                while (offset < data.size && (nextByte and 0x80) != 0) {
                     nextByte = data[offset].toInt() and 0xFF
                     tag = (tag shl 8) or nextByte
                     offset++
